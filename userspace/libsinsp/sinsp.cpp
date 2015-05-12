@@ -1003,6 +1003,23 @@ void sinsp::start_dropping_mode(uint32_t sampling_ratio)
 	}
 }
 
+uint32_t sinsp::get_sampling_ratio()
+{
+	if(m_islive)
+	{
+		uint32_t ret;
+		if(scap_get_sampling_ratio(m_h, &ret) != SCAP_SUCCESS)
+		{
+			throw sinsp_exception(scap_getlasterr(m_h));
+		}
+		return ret;
+	}
+	else
+	{
+		return 1;
+	}
+}
+
 #ifdef HAS_FILTERING
 void sinsp::set_filter(const string& filter)
 {

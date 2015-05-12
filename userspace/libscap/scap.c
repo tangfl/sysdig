@@ -874,6 +874,40 @@ int32_t scap_start_dropping_mode(scap_t* handle, uint32_t sampling_ratio)
 #endif
 }
 
+int32_t scap_get_sampling_ratio(scap_t *handle, uint32_t *sampling_ratio)
+{
+#if !defined(HAS_CAPTURE)
+	snprintf(handler->m_lasterr, SCAP_LASTERR_SIZE, "Live capture not supported on %s", PLATFORM_NAME);
+	return SCAP_FAILURE;
+#else
+    //
+	// Not supported for files
+	//
+	if(handle->m_file)
+	{
+		snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "dropping mode not supported on offline captures");
+		ASSERT(false);
+		return SCAP_FAILURE;
+	}
+
+	if(handle->m_ndevs)
+	{
+		int ret = ioctl(handle->m_devs[0].m_fd, PPM_IOCTL_GET_SAMPLING_RATIO, 0);
+		if(ret >= 0)
+		{
+			*sampling_ratio = ret;
+		}
+		else
+		{
+			snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "%s failed", __FUNCTION__);
+			ASSERT(false);
+			return SCAP_FAILURE;
+		}
+	}
+
+	return SCAP_SUCCESS;
+#endif
+}
 //
 // Return the list of device addresses
 //

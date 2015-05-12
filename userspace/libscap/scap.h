@@ -844,6 +844,7 @@ int32_t scap_getpid_global(scap_t* handle, int64_t* pid);
 void scap_proc_free(scap_t* handle, struct scap_threadinfo* procinfo);
 int32_t scap_stop_dropping_mode(scap_t* handle);
 int32_t scap_start_dropping_mode(scap_t* handle, uint32_t sampling_ratio);
+int32_t scap_get_sampling_ratio(scap_t *handle, uint32_t *sampling_ratio);
 int32_t scap_enable_dynamic_snaplen(scap_t* handle);
 int32_t scap_disable_dynamic_snaplen(scap_t* handle);
 void scap_proc_free_table(scap_t* handle);

@@ -601,6 +601,15 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ret = 0;
 		goto cleanup_ioctl;
 	}
+	case PPM_IOCTL_GET_SAMPLING_RATIO:
+	{
+		if (consumer->dropping_mode == 1) {
+			ret = consumer->sampling_ratio;
+		} else {
+			ret = 0;
+		}
+		goto cleanup_ioctl;
+	}
 	case PPM_IOCTL_SET_SNAPLEN:
 	{
 		u32 new_snaplen;

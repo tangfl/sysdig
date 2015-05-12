@@ -121,7 +121,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #define PPM_CL_NAME_CHANGED (1 << 17)	/* libsinsp-specific flag. Set when the thread name changes */
 										/* (for example because execve was called) */
 #define PPM_CL_CLOSED (1 << 18)			/* thread has been closed. */
-#define PPM_CL_ACTIVE (1 << 19)			/* libsinsp-specific flag. Set in the first non-clone event for 
+#define PPM_CL_ACTIVE (1 << 19)			/* libsinsp-specific flag. Set in the first non-clone event for
 										   this thread. */
 
 /*
@@ -1140,6 +1140,7 @@ struct ppm_evt_hdr {
 #define PPM_IOCTL_GET_CURRENT_PID _IO(PPM_IOCTL_MAGIC, 13)
 #define PPM_IOCTL_DISABLE_SIGNAL_DELIVER _IO(PPM_IOCTL_MAGIC, 14)
 #define PPM_IOCTL_ENABLE_SIGNAL_DELIVER _IO(PPM_IOCTL_MAGIC, 15)
+#define PPM_IOCTL_GET_SAMPLING_RATIO _IO(PPM_IOCTL_MAGIC, 16)
 
 /*!
   \brief System call description struct.
