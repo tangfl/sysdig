@@ -18,7 +18,10 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 
 #pragma once
 
-#include "config.h"
+#include <config_sysdig.h>
+#ifdef HAS_CAPTURE
+#include "../../driver/driver_config.h"
+#endif // HAS_CAPTURE
 
 //
 // ASSERT implementation
@@ -94,7 +97,7 @@ struct summary_table_entry_rsort_comparer
 //
 // Printer functions
 //
-void list_fields(bool verbose);
+void list_fields(bool verbose, bool markdown);
 const char* param_type_to_string(ppm_param_type pt);
 void list_events(sinsp* inspector);
 

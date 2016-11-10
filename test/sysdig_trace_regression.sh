@@ -15,7 +15,7 @@ BRANCH=$3
 if [ ! -d "$TRACEDIR" ]; then
 	mkdir -p $TRACEDIR
 	cd $TRACEDIR
-	wget https://s3.amazonaws.com/download.draios.com/sysdig-tests/traces.zip
+	wget -O traces.zip https://s3.amazonaws.com/download.draios.com/sysdig-tests/traces-$BRANCH.zip || wget -O traces.zip https://s3.amazonaws.com/download.draios.com/sysdig-tests/traces.zip
 	unzip traces.zip
 	rm -rf traces.zip
 	cd -
@@ -37,6 +37,11 @@ ret=0
 # Fields
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000" $TRACEDIR $RESULTDIR/default $BASELINEDIR/default || ret=1
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -pc" $TRACEDIR $RESULTDIR/containers $BASELINEDIR/containers || ret=1
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -t h" $TRACEDIR $RESULTDIR/time_human $BASELINEDIR/time_human || ret=1
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -t a" $TRACEDIR $RESULTDIR/time_absolute $BASELINEDIR/time_absolute || ret=1
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -t r" $TRACEDIR $RESULTDIR/time_relative $BASELINEDIR/time_relative || ret=1
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -t d" $TRACEDIR $RESULTDIR/delta_enter $BASELINEDIR/delta_enter || ret=1
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-n 1000 -t D" $TRACEDIR $RESULTDIR/delta_previous $BASELINEDIR/delta_previous || ret=1
 # Category: CPU Usage
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-ctopcontainers_cpu" $TRACEDIR $RESULTDIR/topcontainers_cpu $BASELINEDIR/topcontainers_cpu || ret=1
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-ctopprocs_cpu" $TRACEDIR $RESULTDIR/topprocs_cpu $BASELINEDIR/topprocs_cpu || ret=1
@@ -97,6 +102,8 @@ $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-clsof" $TRACEDIR $RESULTDIR/l
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-cps" $TRACEDIR $RESULTDIR/ps $BASELINEDIR/ps || ret=1
 # JSON
 $BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-j -n 10000" $TRACEDIR $RESULTDIR/fd_fields_json $BASELINEDIR/fd_fields_json || ret=1
+# Sessions
+$BASEDIR/sysdig_batch_parser.sh $SYSDIG $CHISELS "-p '*%evt.num %evt.outputtime %evt.cpu %proc.name (%thread.tid) %evt.dir %evt.type %evt.info sid=%proc.sid sname=%proc.sname'" $TRACEDIR $RESULTDIR/sessions $BASELINEDIR/sessions || ret=1
 
 rm -rf "${TMPBASE}"
 exit $ret

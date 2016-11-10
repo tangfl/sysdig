@@ -20,7 +20,9 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <fstream>
 #include <cctype>
 #include <locale>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <limits.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -35,6 +37,9 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include "chisel_api.h"
 #include "filter.h"
 #include "filterchecks.h"
+#ifdef HAS_ANALYZER
+#include "analyzer.h"
+#endif
 
 #ifdef HAS_CHISELS
 #define HAS_LUA_CHISELS
@@ -76,6 +81,7 @@ uint32_t lua_cbacks::rawval_to_lua_stack(lua_State *ls, uint8_t* rawval, const f
 		case PT_INT64:
 		case PT_ERRNO:
 		case PT_PID:
+		case PT_FD:
 			lua_pushnumber(ls, (double)*(int64_t*)rawval);
 			return 1;
 		case PT_L4PROTO: // This can be resolved in the future
@@ -99,13 +105,16 @@ uint32_t lua_cbacks::rawval_to_lua_stack(lua_State *ls, uint8_t* rawval, const f
 		case PT_ABSTIME:
 			lua_pushnumber(ls, (double)*(uint64_t*)rawval);
 			return 1;
+		case PT_DOUBLE:
+			lua_pushnumber(ls, *(double*)rawval);
+			return 1;
 		case PT_CHARBUF:
 			lua_pushstring(ls, (char*)rawval);
 			return 1;
 		case PT_BYTEBUF:
 			if(rawval[len] == 0)
 			{
-				lua_pushstring(ls, (char*)rawval);
+				lua_pushlstring(ls, (char*)rawval, len);
 				return 1;
 			}
 			else
@@ -119,7 +128,7 @@ uint32_t lua_cbacks::rawval_to_lua_stack(lua_State *ls, uint8_t* rawval, const f
 
 				memcpy(ch->m_lua_fld_storage, rawval, max_len);
 				ch->m_lua_fld_storage[max_len] = 0;
-				lua_pushstring(ls, (char*)ch->m_lua_fld_storage);
+				lua_pushlstring(ls, (char*)ch->m_lua_fld_storage, max_len);
 				return 1;
 			}
 		case PT_SOCKADDR:
@@ -275,7 +284,7 @@ int lua_cbacks::request_field(lua_State *ls)
 		throw sinsp_exception("chisel error");
 	}
 
-	chk->parse_field_name(fld);
+	chk->parse_field_name(fld, true);
 
 	lua_pushlightuserdata(ls, chk);
 
@@ -435,6 +444,14 @@ int lua_cbacks::set_output_format(lua_State *ls)
 	else if(string(fmt) == "ascii")
 	{
 		ch->m_inspector->set_buffer_format(sinsp_evt::PF_EOLS);
+	}
+	else if(string(fmt) == "base64")
+	{
+		ch->m_inspector->set_buffer_format(sinsp_evt::PF_BASE64);
+	}
+	else if(string(fmt) == "jsonbase64")
+	{
+		ch->m_inspector->set_buffer_format(sinsp_evt::PF_JSONBASE64);
 	}
 	else
 	{
@@ -620,6 +637,7 @@ int lua_cbacks::get_thread_table(lua_State *ls)
 	threadinfo_map_iterator_t it;
 	unordered_map<int64_t, sinsp_fdinfo_t>::iterator fdit;
 	uint32_t j;
+	sinsp_filter_compiler* compiler = NULL;
 	sinsp_filter* filter = NULL;
 	sinsp_evt tevt;
 	scap_evt tscapevt;
@@ -647,7 +665,8 @@ int lua_cbacks::get_thread_table(lua_State *ls)
 
 		try
 		{
-			filter = new sinsp_filter(ch->m_inspector, filterstr, true);
+			compiler = new sinsp_filter_compiler(ch->m_inspector, filterstr, true);
+			filter = compiler->compile();
 		}
 		catch(sinsp_exception& e)
 		{
@@ -1038,6 +1057,14 @@ int lua_cbacks::get_container_table(lua_State *ls)
 		{
 			lua_pushstring(ls, "libvirt_lxc");
 		}
+		else if(it->second.m_type == CT_MESOS)
+		{
+			lua_pushstring(ls, "mesos");
+		}
+		else if(it->second.m_type == CT_RKT)
+		{
+			lua_pushstring(ls, "rkt");
+		}
 		else
 		{
 			ASSERT(false);
@@ -1203,5 +1230,161 @@ int lua_cbacks::exec(lua_State *ls)
 	return 0;
 }
 
+int lua_cbacks::log(lua_State *ls) 
+{
+	lua_getglobal(ls, "sichisel");
+
+	string message(lua_tostring(ls, 1));
+	string sevstr(lua_tostring(ls, 2));
+
+	sinsp_logger::severity sevcode = sinsp_logger::SEV_INFO;
+
+	if(sevstr == "debug")
+	{
+		sevcode = sinsp_logger::SEV_DEBUG;
+	}
+	else if(sevstr == "info")
+	{
+		sevcode = sinsp_logger::SEV_INFO;
+	}
+	else if(sevstr == "warning")
+	{
+		sevcode = sinsp_logger::SEV_WARNING;
+	}
+	else if(sevstr == "error")
+	{
+		sevcode = sinsp_logger::SEV_ERROR;
+	}
+	else if(sevstr == "critical")
+	{
+		sevcode = sinsp_logger::SEV_CRITICAL;
+	}
+
+	g_logger.log(message, sevcode);
+
+	return 0;
+}
+
+int lua_cbacks::udp_setpeername(lua_State *ls) 
+{
+	lua_getglobal(ls, "sichisel");
+	sinsp_chisel* ch = (sinsp_chisel*)lua_touserdata(ls, -1);
+
+	string addr(lua_tostring(ls, 1));
+	string ports(lua_tostring(ls, 2));
+	uint16_t port = htons(sinsp_numparser::parseu16(ports));
+
+	ch->m_udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+	if(ch->m_udp_socket < 0)
+	{
+		string err = "udp_setpeername error: unable to create the socket";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	memset(&ch->m_serveraddr, 0, sizeof(ch->m_serveraddr));
+	ch->m_serveraddr.sin_family = AF_INET;
+	ch->m_serveraddr.sin_port = port;
+	if(inet_pton(AF_INET, addr.c_str(), &ch->m_serveraddr.sin_addr) <= 0)
+	{
+		string err = "inet_pton error occured";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	return 0;
+}
+
+int lua_cbacks::udp_send(lua_State *ls) 
+{
+	lua_getglobal(ls, "sichisel");
+	sinsp_chisel* ch = (sinsp_chisel*)lua_touserdata(ls, -1);
+
+	string message(lua_tostring(ls, 1));
+
+	if(sendto(ch->m_udp_socket, message.c_str(), message.size(), 0, 
+		(struct sockaddr *)&ch->m_serveraddr, sizeof(ch->m_serveraddr)) < 0)
+	{
+		string err = "udp_send error: cannot send the buffer: ";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	return 0;
+}
+
+#ifdef HAS_ANALYZER
+int lua_cbacks::push_metric(lua_State *ls) 
+{
+	statsd_metric metric;
+	metric.m_type = statsd_metric::type_t::GAUGE;
+
+	lua_getglobal(ls, "sichisel");
+
+	sinsp_chisel* ch = (sinsp_chisel*)lua_touserdata(ls, -1);
+	lua_pop(ls, 1);
+
+	ASSERT(ch);
+	ASSERT(ch->m_lua_cinfo);
+
+	sinsp* inspector = ch->m_inspector;
+
+	//
+	// tags
+	//
+	if(lua_istable(ls, 3))
+	{
+		lua_pushnil(ls);
+
+		while(lua_next(ls, 3) != 0) 
+		{
+			string tag = lua_tostring(ls, -1);
+			metric.m_tags[tag] = "";
+			lua_pop(ls, 1);
+		}
+
+		lua_pop(ls, 1);
+	}
+	else
+	{
+		string err = "error in chisel " + ch->m_filename + ": third argument must be a table";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	//
+	// Name
+	//
+	if(lua_isstring(ls, 1))
+	{
+		metric.m_name = lua_tostring(ls, 1);
+	}
+	else
+	{
+		string err = "errord in chisel " + ch->m_filename + ": first argument must be a string";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	//
+	// Value
+	//
+	if(lua_isnumber(ls, 2))
+	{
+		metric.m_value = lua_tonumber(ls, 2);
+	}
+	else
+	{
+		string err = "errord in chisel " + ch->m_filename + ": second argument must be a number";
+		fprintf(stderr, "%s\n", err.c_str());
+		throw sinsp_exception("chisel error");
+	}
+
+	inspector->m_analyzer->add_chisel_metric(&metric);
+
+	return 0;
+}
+
+#endif // HAS_ANALYZER
 #endif // HAS_LUA_CHISELS
 #endif // HAS_CHISELS

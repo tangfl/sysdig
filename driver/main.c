@@ -19,6 +19,14 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
 #include <linux/version.h>
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 20)
+#include <linux/kobject.h>
+#include <trace/sched.h>
+#include "ppm_syscall.h"
+#include <trace/syscall.h>
+#else
+#include <asm/syscall.h>
+#endif
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 37))
 #include <asm/atomic.h>
 #else
@@ -34,21 +42,23 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/tracepoint.h>
-#include <asm/syscall.h>
+#include <linux/cpu.h>
+#include <linux/jiffies.h>
 #include <net/sock.h>
-
+#include <asm/asm-offsets.h>	/* For NR_syscalls */
 #include <asm/unistd.h>
 
+#include "driver_config.h"
 #include "ppm_ringbuffer.h"
 #include "ppm_events_public.h"
 #include "ppm_events.h"
 #include "ppm.h"
+#if defined(CONFIG_IA32_EMULATION) && !defined(__NR_ia32_socketcall)
+#include "ppm_compat_unistd_32.h"
+#endif
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Draios");
-
-#define PPM_DEVICE_NAME "sysdig"
-#define PPE_DEVICE_NAME PPM_DEVICE_NAME "-events"
+MODULE_AUTHOR("sysdig inc");
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
     #define TRACEPOINT_PROBE_REGISTER(p1, p2) tracepoint_probe_register(p1, p2)
@@ -68,11 +78,14 @@ struct ppm_device {
 
 struct event_data_t {
 	enum ppm_capture_category category;
+	int socketcall_syscall;
+	bool compat;
 
 	union {
 		struct {
 			struct pt_regs *regs;
 			long id;
+			const enum ppm_syscall_code *cur_g_syscall_code_routing_table;
 		} syscall_data;
 
 		struct {
@@ -105,7 +118,7 @@ static void record_event_all_consumers(enum ppm_event_type event_type,
 	struct event_data_t *event_datap);
 static int init_ring_buffer(struct ppm_ring_buffer_context *ring);
 static void free_ring_buffer(struct ppm_ring_buffer_context *ring);
-static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+void ppm_task_cputime_adjusted(struct task_struct *p, cputime_t *ut, cputime_t *st);
 
 #ifndef CONFIG_HAVE_SYSCALL_TRACEPOINTS
  #error The kernel must have HAVE_SYSCALL_TRACEPOINTS in order for sysdig to be useful
@@ -117,8 +130,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p);
 #ifdef CAPTURE_CONTEXT_SWITCHES
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, struct task_struct *next);
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0))
 TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next);
+#else
+TRACEPOINT_PROBE(sched_switch_probe, bool preempt, struct task_struct *prev, struct task_struct *next);
 #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)) */
 #endif /* CAPTURE_CONTEXT_SWITCHES */
 
@@ -131,17 +146,12 @@ static struct ppm_device *g_ppm_devs;
 static struct class *g_ppm_class;
 static unsigned int g_ppm_numdevs;
 static int g_ppm_major;
+bool g_tracers_enabled = false;
 static const struct file_operations g_ppm_fops = {
 	.open = ppm_open,
 	.release = ppm_release,
 	.mmap = ppm_mmap,
 	.unlocked_ioctl = ppm_ioctl,
-	.owner = THIS_MODULE,
-};
-
-/* Events file operations */
-static const struct file_operations g_ppe_fops = {
-	.write = ppe_write,
 	.owner = THIS_MODULE,
 };
 
@@ -152,11 +162,11 @@ LIST_HEAD(g_consumer_list);
 static DEFINE_MUTEX(g_consumer_mutex);
 static bool g_tracepoint_registered;
 
-struct cdev *g_ppe_cdev = NULL;
-struct device *g_ppe_dev = NULL;
-
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 static struct tracepoint *tp_sys_enter;
 static struct tracepoint *tp_sys_exit;
+#endif
+
 static struct tracepoint *tp_sched_process_exit;
 #ifdef CAPTURE_CONTEXT_SWITCHES
 static struct tracepoint *tp_sched_switch;
@@ -219,8 +229,9 @@ static void check_remove_consumer(struct ppm_consumer_t *consumer, int remove_fr
 	int cpu;
 	int open_rings = 0;
 
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+
 		if (ring && ring->open)
 			++open_rings;
 	}
@@ -233,10 +244,10 @@ static void check_remove_consumer(struct ppm_consumer_t *consumer, int remove_fr
 			synchronize_rcu();
 		}
 
-		for_each_online_cpu(cpu) {
+		for_each_possible_cpu(cpu) {
 			struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, cpu);
 
-			if (ring)
+			if (ring->cpu_online)
 				free_ring_buffer(ring);
 		}
 
@@ -253,10 +264,14 @@ static int ppm_open(struct inode *inode, struct file *filp)
 {
 	int ret;
 	int in_list = false;
-	struct ppm_ring_buffer_context *ring = NULL;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	int ring_no = iminor(filp->f_path.dentry->d_inode);
+#else
+	int ring_no = iminor(filp->f_dentry->d_inode);
+#endif
 	struct task_struct *consumer_id = current;
 	struct ppm_consumer_t *consumer = NULL;
+	struct ppm_ring_buffer_context *ring = NULL;
 
 	/*
 	 * Tricky: to identify a consumer, attach the thread id
@@ -308,22 +323,34 @@ static int ppm_open(struct inode *inode, struct file *filp)
 			goto cleanup_open;
 		}
 
-		for_each_online_cpu(cpu) {
-			struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+		/*
+		 * Note, we have two loops here because the first one makes sure that ALL of the
+		 * rings are properly initialized to null, since the second one could be interrupted
+		 * and cause issues in the cleanup phase.
+		 * This might not be necessary, because alloc_percpu memsets the allocated entries to
+		 * 0, but better be extra safe.
+		 */
+		for_each_possible_cpu(cpu) {
+			ring = per_cpu_ptr(consumer->ring_buffers, cpu);
 
+			ring->cpu_online = false;
 			ring->str_storage = NULL;
 			ring->buffer = NULL;
 			ring->info = NULL;
 		}
 
 		for_each_online_cpu(cpu) {
+			ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+
 			pr_info("initializing ring buffer for CPU %u\n", cpu);
 
-			if (!init_ring_buffer(per_cpu_ptr(consumer->ring_buffers, cpu))) {
+			if (!init_ring_buffer(ring)) {
 				pr_err("can't initialize the ring buffer for CPU %u\n", cpu);
 				ret = -ENOMEM;
 				goto err_init_ring_buffer;
 			}
+
+			ring->cpu_online = true;
 		}
 
 		list_add_rcu(&consumer->node, &g_consumer_list);
@@ -333,6 +360,15 @@ static int ppm_open(struct inode *inode, struct file *filp)
 	}
 
 	ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+
+	/*
+	 * Check if the CPU pointed by this device is online. If it isn't stop here and
+	 * return ENODEV.
+	 */
+	if (ring->cpu_online == false) {
+		ret = -ENODEV;
+		goto cleanup_open;
+	}
 
 	if (ring->open) {
 		pr_err("invalid operation: attempting to open device %d multiple times for consumer %p\n", ring_no, consumer->consumer_id);
@@ -375,13 +411,22 @@ static int ppm_open(struct inode *inode, struct file *filp)
 		/*
 		 * Enable the tracepoints
 		 */
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 		ret = compat_register_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+#else
+		ret = register_trace_syscall_enter(syscall_enter_probe);
+#endif
 		if (ret) {
 			pr_err("can't create the sys_exit tracepoint\n");
 			goto err_sys_exit;
 		}
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 		ret = compat_register_trace(syscall_enter_probe, "sys_enter", tp_sys_enter);
+#else
+		ret = register_trace_syscall_exit(syscall_exit_probe);
+#endif
 		if (ret) {
 			pr_err("can't create the sys_enter tracepoint\n");
 			goto err_sys_enter;
@@ -422,9 +467,17 @@ err_signal_deliver:
 err_sched_switch:
 	compat_unregister_trace(syscall_procexit_probe, "sched_process_exit", tp_sched_process_exit);
 err_sched_procexit:
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	compat_unregister_trace(syscall_enter_probe, "sys_enter", tp_sys_enter);
+#else
+	unregister_trace_syscall_enter(syscall_enter_probe);
+#endif
 err_sys_enter:
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+#else
+	unregister_trace_syscall_exit(syscall_exit_probe);
+#endif
 err_sys_exit:
 	ring->open = false;
 err_init_ring_buffer:
@@ -439,7 +492,11 @@ static int ppm_release(struct inode *inode, struct file *filp)
 {
 	int ret;
 	struct ppm_ring_buffer_context *ring;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	int ring_no = iminor(filp->f_path.dentry->d_inode);
+#else
+	int ring_no = iminor(filp->f_dentry->d_inode);
+#endif
 	struct task_struct *consumer_id = filp->private_data;
 	struct ppm_consumer_t *consumer = NULL;
 
@@ -453,6 +510,11 @@ static int ppm_release(struct inode *inode, struct file *filp)
 	}
 
 	ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+	if (!ring) {
+		ASSERT(false);
+		ret = -ENODEV;
+		goto cleanup_release;
+	}
 
 	if (!ring->open) {
 		pr_err("attempting to close unopened device %d for consumer %p\n", ring_no, consumer_id);
@@ -482,8 +544,13 @@ static int ppm_release(struct inode *inode, struct file *filp)
 		if (g_tracepoint_registered) {
 			pr_info("no more consumers, stopping capture\n");
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 			compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
 			compat_unregister_trace(syscall_enter_probe, "sys_enter", tp_sys_enter);
+#else
+			unregister_trace_syscall_exit(syscall_exit_probe);
+			unregister_trace_syscall_enter(syscall_enter_probe);
+#endif
 			compat_unregister_trace(syscall_procexit_probe, "sched_process_exit", tp_sched_process_exit);
 
 #ifdef CAPTURE_CONTEXT_SWITCHES
@@ -492,7 +559,9 @@ static int ppm_release(struct inode *inode, struct file *filp)
 #ifdef CAPTURE_SIGNAL_DELIVERIES
 			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
 #endif
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 			tracepoint_synchronize_unregister();
+#endif
 			g_tracepoint_registered = false;
 		} else {
 			ASSERT(false);
@@ -513,6 +582,101 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct task_struct *consumer_id = filp->private_data;
 	struct ppm_consumer_t *consumer = NULL;
 
+	if (cmd == PPM_IOCTL_GET_PROCLIST) {
+		struct ppm_proclist_info *proclist_info = NULL;
+		struct task_struct *p, *t;
+		u64 nentries = 0;
+		struct ppm_proclist_info pli;
+		u32 memsize;
+
+		if (copy_from_user(&pli, (void *)arg, sizeof(pli))) {
+			ret = -EINVAL;
+			goto cleanup_ioctl_nolock;
+		}
+
+		vpr_info("PPM_IOCTL_GET_PROCLIST, size=%d\n", (int)pli.max_entries);
+
+		memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * pli.max_entries;
+		proclist_info = vmalloc(memsize);
+		if (!proclist_info) {
+			ret = -EINVAL;
+			goto cleanup_ioctl_nolock;
+		}
+
+		proclist_info->max_entries = pli.max_entries;
+
+		rcu_read_lock();
+
+#ifdef for_each_process_thread
+		for_each_process_thread(p, t) {
+#else
+#ifdef for_each_process_all
+		for_each_process_all(p) {
+#else
+		for_each_process(p) {
+#endif
+			t = p;
+			do {
+				task_lock(p);
+#endif
+				if (nentries < pli.max_entries) {
+					cputime_t utime, stime;
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
+					task_cputime_adjusted(t, &utime, &stime);
+#else
+					ppm_task_cputime_adjusted(t, &utime, &stime);
+#endif
+					proclist_info->entries[nentries].pid = t->pid;
+					proclist_info->entries[nentries].utime = cputime_to_clock_t(utime);
+					proclist_info->entries[nentries].stime = cputime_to_clock_t(stime);
+				}
+
+				nentries++;
+#ifdef for_each_process_thread
+		}
+#else
+				task_unlock(p);
+#ifdef while_each_thread_all
+			} while_each_thread_all(p, t);
+		}
+#else
+			} while_each_thread(p, t);
+		}
+#endif
+#endif
+
+		rcu_read_unlock();
+
+		proclist_info->n_entries = nentries;
+
+		if (nentries >= pli.max_entries) {
+			vpr_info("PPM_IOCTL_GET_PROCLIST: not enough space (%d avail, %d required)\n",
+				(int)pli.max_entries,
+				(int)nentries);
+
+			if (copy_to_user((void *)arg, proclist_info, sizeof(struct ppm_proclist_info))) {
+				ret = -EINVAL;
+				goto cleanup_ioctl_procinfo;
+			}
+
+			ret = -ENOSPC;
+			goto cleanup_ioctl_procinfo;
+		} else {
+			memsize = sizeof(struct ppm_proclist_info) + sizeof(struct ppm_proc_info) * nentries;
+
+			if (copy_to_user((void *)arg, proclist_info, memsize)) {
+				ret = -EINVAL;
+				goto cleanup_ioctl_procinfo;
+			}
+		}
+
+		ret = 0;
+cleanup_ioctl_procinfo:
+		vfree((void*)proclist_info);
+		goto cleanup_ioctl_nolock;
+	}
+
 	mutex_lock(&g_consumer_mutex);
 
 	consumer = ppm_find_consumer(consumer_id);
@@ -525,8 +689,17 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case PPM_IOCTL_DISABLE_CAPTURE:
 	{
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 		int ring_no = iminor(filp->f_path.dentry->d_inode);
+#else
+		int ring_no = iminor(filp->f_dentry->d_inode);
+#endif
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+
+		if (!ring) {
+			ASSERT(false);
+			return -ENODEV;
+		}
 
 		ring->capture_enabled = false;
 
@@ -537,8 +710,17 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 	case PPM_IOCTL_ENABLE_CAPTURE:
 	{
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 		int ring_no = iminor(filp->f_path.dentry->d_inode);
+#else
+		int ring_no = iminor(filp->f_dentry->d_inode);
+#endif
 		struct ppm_ring_buffer_context *ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+
+		if (!ring) {
+			ASSERT(false);
+			return -ENODEV;
+		}
 
 		ring->capture_enabled = true;
 
@@ -679,6 +861,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ret = 0;
 		goto cleanup_ioctl;
 	}
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	case PPM_IOCTL_GET_VTID:
 	case PPM_IOCTL_GET_VPID:
 	{
@@ -689,7 +872,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		rcu_read_lock();
 		pid = find_pid_ns(arg, &init_pid_ns);
-		if(!pid) {
+		if (!pid) {
 			rcu_read_unlock();
 			ret = -EINVAL;
 			goto cleanup_ioctl;
@@ -703,13 +886,13 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 
 		ns = ns_of_pid(pid);
-		if(!pid) {
+		if (!pid) {
 			rcu_read_unlock();
 			ret = -EINVAL;
 			goto cleanup_ioctl;
 		}
 
-		if(cmd == PPM_IOCTL_GET_VTID)
+		if (cmd == PPM_IOCTL_GET_VTID)
 			vid = task_pid_nr_ns(task, ns);
 		else
 			vid = task_tgid_nr_ns(task, ns);
@@ -718,17 +901,20 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ret = vid;
 		goto cleanup_ioctl;
 	}
+#endif
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	case PPM_IOCTL_GET_CURRENT_TID:
 		ret = task_pid_nr(current);
 		goto cleanup_ioctl;
 	case PPM_IOCTL_GET_CURRENT_PID:
 		ret = task_tgid_nr(current);
 		goto cleanup_ioctl;
+#endif /* LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20) */
 #ifdef CAPTURE_SIGNAL_DELIVERIES
 	case PPM_IOCTL_DISABLE_SIGNAL_DELIVER:
 	{
 		vpr_info("PPM_IOCTL_DISABLE_SIGNAL_DELIVER\n");
-		if (g_tracepoint_registered) 
+		if (g_tracepoint_registered)
 			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
 		ret = 0;
 		goto cleanup_ioctl;
@@ -742,6 +928,13 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		goto cleanup_ioctl;
 	}
 #endif
+	case PPM_IOCTL_SET_TRACERS_CAPTURE:
+	{
+		vpr_info("PPM_IOCTL_SET_TRACERS_CAPTURE, consumer %p\n", consumer_id);
+		g_tracers_enabled = true;
+		ret = 0;
+		goto cleanup_ioctl;
+	}
 	default:
 		ret = -ENOTTY;
 		goto cleanup_ioctl;
@@ -749,7 +942,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 cleanup_ioctl:
 	mutex_unlock(&g_consumer_mutex);
-
+cleanup_ioctl_nolock:
 	return ret;
 }
 
@@ -774,7 +967,11 @@ static int ppm_mmap(struct file *filp, struct vm_area_struct *vma)
 		unsigned long pfn;
 		char *vmalloc_area_ptr;
 		char *orig_vmalloc_area_ptr;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 		int ring_no = iminor(filp->f_path.dentry->d_inode);
+#else
+		int ring_no = iminor(filp->f_dentry->d_inode);
+#endif
 		struct ppm_ring_buffer_context *ring;
 
 		vpr_info("mmap for consumer %p, CPU %d, start=%lu len=%ld page_size=%lu\n",
@@ -805,6 +1002,10 @@ static int ppm_mmap(struct file *filp, struct vm_area_struct *vma)
 		 * Retrieve the ring structure for this CPU
 		 */
 		ring = per_cpu_ptr(consumer->ring_buffers, ring_no);
+		if (!ring) {
+			ASSERT(false);
+			return -ENODEV;
+		}
 
 		if (length <= PAGE_SIZE) {
 			/*
@@ -908,11 +1109,6 @@ cleanup_mmap:
 	return ret;
 }
 
-static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
-{
-	return count;
-}
-
 /* Argument list sizes for sys_socketcall */
 #define AL(x) ((x) * sizeof(unsigned long))
 static const unsigned char nas[21] = {
@@ -922,8 +1118,19 @@ static const unsigned char nas[21] = {
 	AL(4), AL(5), AL(4)
 };
 #undef AL
+#ifdef CONFIG_COMPAT
+#define AL(x) ((x) * sizeof(compat_ulong_t))
+static const unsigned char compat_nas[21] = {
+	AL(0), AL(3), AL(3), AL(3), AL(2), AL(3),
+	AL(3), AL(3), AL(4), AL(4), AL(4), AL(6),
+	AL(6), AL(2), AL(5), AL(5), AL(3), AL(3),
+	AL(4), AL(5), AL(4)
+};
+#undef AL
+#endif
 
-#ifdef __NR_socketcall
+
+#ifdef _HAS_SOCKETCALL
 static enum ppm_event_type parse_socketcall(struct event_filler_arguments *filler_args, struct pt_regs *regs)
 {
 	unsigned long __user args[2];
@@ -944,8 +1151,22 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
 #endif
 		return PPME_GENERIC_E;
 
-	if (unlikely(ppm_copy_from_user(filler_args->socketcall_args, scargs, nas[socketcall_id])))
-		return PPME_GENERIC_E;
+#ifdef CONFIG_COMPAT
+	if (unlikely(filler_args->compat)) {
+		compat_ulong_t socketcall_args32[6];
+		int j;
+
+		if (unlikely(ppm_copy_from_user(socketcall_args32, compat_ptr(args[1]), compat_nas[socketcall_id])))
+			return PPME_GENERIC_E;
+		for (j = 0; j < 6; ++j)
+			filler_args->socketcall_args[j] = (unsigned long)socketcall_args32[j];
+	} else {
+#endif
+		if (unlikely(ppm_copy_from_user(filler_args->socketcall_args, scargs, nas[socketcall_id])))
+			return PPME_GENERIC_E;
+#ifdef CONFIG_COMPAT
+	}
+#endif
 
 	switch (socketcall_id) {
 	case SYS_SOCKET:
@@ -957,7 +1178,7 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
 	case SYS_LISTEN:
 		return PPME_SOCKET_LISTEN_E;
 	case SYS_ACCEPT:
-		return PPME_SOCKET_ACCEPT_E;
+		return PPME_SOCKET_ACCEPT_5_E;
 	case SYS_GETSOCKNAME:
 		return PPME_SOCKET_GETSOCKNAME_E;
 	case SYS_GETPEERNAME:
@@ -991,17 +1212,18 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
 		return PPME_SOCKET_RECVMMSG_E;
 #endif
 	case SYS_ACCEPT4:
-		return PPME_SOCKET_ACCEPT4_E;
+		return PPME_SOCKET_ACCEPT4_5_E;
 	default:
 		ASSERT(false);
 		return PPME_GENERIC_E;
 	}
 }
-#endif /* __NR_socketcall */
+#endif /* _HAS_SOCKETCALL */
 
 static inline void record_drop_e(struct ppm_consumer_t *consumer, struct timespec *ts)
 {
 	struct event_data_t event_data = {0};
+
 	if (record_event_consumer(consumer, PPME_DROP_E, UF_NEVER_DROP, ts, &event_data) == 0) {
 		consumer->need_to_insert_drop_e = 1;
 	} else {
@@ -1015,6 +1237,7 @@ static inline void record_drop_e(struct ppm_consumer_t *consumer, struct timespe
 static inline void record_drop_x(struct ppm_consumer_t *consumer, struct timespec *ts)
 {
 	struct event_data_t event_data = {0};
+
 	if (record_event_consumer(consumer, PPME_DROP_X, UF_NEVER_DROP, ts, &event_data) == 0) {
 		consumer->need_to_insert_drop_x = 1;
 	} else {
@@ -1082,7 +1305,7 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 	struct event_data_t *event_datap)
 {
 	int res = 0;
-	size_t event_size;
+	size_t event_size = 0;
 	int next;
 	u32 freespace;
 	u32 usedspace;
@@ -1114,6 +1337,8 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 	 */
 	cpu = get_cpu();
 	ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+	ASSERT(ring);
+
 	ring_info = ring->info;
 
 	if (!ring->capture_enabled) {
@@ -1123,16 +1348,14 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 
 	ring_info->n_evts++;
 	if (event_datap->category == PPMC_CONTEXT_SWITCH && event_datap->event_info.context_data.sched_prev != NULL) {
-		if (event_type != PPME_SYSDIGEVENT_E) {
+		if (event_type != PPME_SYSDIGEVENT_E && event_type != PPME_CPU_HOTPLUG_E) {
 			ASSERT(event_datap->event_info.context_data.sched_prev != NULL);
 			ASSERT(event_datap->event_info.context_data.sched_next != NULL);
-			//ASSERT(regs == NULL);
 			ring_info->n_context_switches++;
 		}
 	} else if (event_datap->category == PPMC_SIGNAL) {
-		if (event_type == PPME_SIGNALDELIVER_E) {
+		if (event_type == PPME_SIGNALDELIVER_E)
 			ASSERT(event_datap->event_info.signal_data.info != NULL);
-		}
 	}
 
 	/*
@@ -1166,7 +1389,7 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 	ASSERT(head <= RING_BUF_SIZE);
 	ASSERT(delta_from_end < RING_BUF_SIZE + (2 * PAGE_SIZE));
 	ASSERT(delta_from_end > (2 * PAGE_SIZE) - 1);
-#ifdef __NR_socketcall
+#ifdef _HAS_SOCKETCALL
 	/*
 	 * If this is a socketcall system call, determine the correct event type
 	 * by parsing the arguments and patch event_type accordingly
@@ -1177,16 +1400,24 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 	 * second argument contains a pointer to the arguments of the original
 	 * call. I guess this was done to reduce the number of syscalls...
 	 */
-	if (event_datap->category == PPMC_SYSCALL && event_datap->event_info.syscall_data.regs && event_datap->event_info.syscall_data.id == __NR_socketcall) {
+	if (event_datap->category == PPMC_SYSCALL && event_datap->event_info.syscall_data.regs && event_datap->event_info.syscall_data.id == event_datap->socketcall_syscall) {
 		enum ppm_event_type tet;
 
+		args.is_socketcall = true;
+		args.compat = true;
 		tet = parse_socketcall(&args, event_datap->event_info.syscall_data.regs);
 
 		if (event_type == PPME_GENERIC_E)
 			event_type = tet;
 		else
 			event_type = tet + 1;
+
+	} else {
+		args.is_socketcall = false;
+		args.compat = false;
 	}
+
+	args.socketcall_syscall = event_datap->socketcall_syscall;
 #endif
 
 	ASSERT(event_type < PPM_EVENT_MAX);
@@ -1228,9 +1459,13 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 		if (event_datap->category == PPMC_SYSCALL) {
 			args.regs = event_datap->event_info.syscall_data.regs;
 			args.syscall_id = event_datap->event_info.syscall_data.id;
+			args.cur_g_syscall_code_routing_table = event_datap->event_info.syscall_data.cur_g_syscall_code_routing_table;
+			args.compat = event_datap->compat;
 		} else {
 			args.regs = NULL;
 			args.syscall_id = -1;
+			args.cur_g_syscall_code_routing_table = NULL;
+			args.compat = false;
 		}
 
 		if (event_datap->category == PPMC_CONTEXT_SWITCH) {
@@ -1378,38 +1613,52 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
 TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
 {
 	long table_index;
+	const struct syscall_evt_pair *cur_g_syscall_table = g_syscall_table;
+	const enum ppm_syscall_code *cur_g_syscall_code_routing_table = g_syscall_code_routing_table;
+	bool compat = false;
+#ifdef __NR_socketcall
+	int socketcall_syscall = __NR_socketcall;
+#else
+	int socketcall_syscall = -1;
+#endif
 
-#ifdef CONFIG_X86_64
+#if defined(CONFIG_X86_64) && defined(CONFIG_IA32_EMULATION)
 	/*
 	 * If this is a 32bit process running on a 64bit kernel (see the CONFIG_IA32_EMULATION
-	 * kernel flag), we skip its events.
-	 * XXX Decide what to do about this.
+	 * kernel flag), we switch to the ia32 syscall table.
 	 */
-	if (unlikely(test_tsk_thread_flag(current, TIF_IA32)))
-		return;
+	if (unlikely(task_thread_info(current)->status & TS_COMPAT)) {
+		cur_g_syscall_table = g_syscall_ia32_table;
+		cur_g_syscall_code_routing_table = g_syscall_ia32_code_routing_table;
+		socketcall_syscall = __NR_ia32_socketcall;
+		compat = true;
+	}
 #endif
 
 	table_index = id - SYSCALL_TABLE_ID0;
 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
 		struct event_data_t event_data;
-		int used = g_syscall_table[table_index].flags & UF_USED;
-		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+		int used = cur_g_syscall_table[table_index].flags & UF_USED;
+		enum syscall_flags drop_flags = cur_g_syscall_table[table_index].flags;
 		enum ppm_event_type type;
 
-#ifdef __NR_socketcall
-		if (id == __NR_socketcall) {
+#ifdef _HAS_SOCKETCALL
+		if (id == socketcall_syscall) {
 			used = true;
 			drop_flags = UF_NEVER_DROP;
 			type = PPME_GENERIC_E;
 		} else
-			type = g_syscall_table[table_index].enter_event_type;
+			type = cur_g_syscall_table[table_index].enter_event_type;
 #else
-		type = g_syscall_table[table_index].enter_event_type;
+		type = cur_g_syscall_table[table_index].enter_event_type;
 #endif
 
 		event_data.category = PPMC_SYSCALL;
 		event_data.event_info.syscall_data.regs = regs;
 		event_data.event_info.syscall_data.id = id;
+		event_data.event_info.syscall_data.cur_g_syscall_code_routing_table = cur_g_syscall_code_routing_table;
+		event_data.socketcall_syscall = socketcall_syscall;
+		event_data.compat = compat;
 
 		if (used)
 			record_event_all_consumers(type, drop_flags, &event_data);
@@ -1422,40 +1671,56 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
 {
 	int id;
 	long table_index;
-
-#ifdef CONFIG_X86_64
-	/*
-     * If this is a 32bit process running on a 64bit kernel (see the CONFIG_IA32_EMULATION
-	 * kernel flag), we skip its events.
-	 * XXX Decide what to do about this.
-	 */
-	if (unlikely(test_tsk_thread_flag(current, TIF_IA32)))
-		return;
+	const struct syscall_evt_pair *cur_g_syscall_table = g_syscall_table;
+	const enum ppm_syscall_code *cur_g_syscall_code_routing_table = g_syscall_code_routing_table;
+	bool compat = false;
+#ifdef __NR_socketcall
+	int socketcall_syscall = __NR_socketcall;
+#else
+	int socketcall_syscall = -1;
 #endif
 
 	id = syscall_get_nr(current, regs);
 
+#if defined(CONFIG_X86_64) && defined(CONFIG_IA32_EMULATION)
+	/*
+	 * When a process does execve from 64bit to 32bit, TS_COMPAT is marked true
+	 * but the id of the syscall is __NR_execve, so to correctly parse it we need to
+	 * use 64bit syscall table. On 32bit __NR_execve is equal to __NR_ia32_oldolduname
+	 * which is a very old syscall, not used anymore by most applications
+	 */
+	if (unlikely((task_thread_info(current)->status & TS_COMPAT) && id != __NR_execve)) {
+		cur_g_syscall_table = g_syscall_ia32_table;
+		cur_g_syscall_code_routing_table = g_syscall_ia32_code_routing_table;
+		socketcall_syscall = __NR_ia32_socketcall;
+		compat = true;
+	}
+#endif
+
 	table_index = id - SYSCALL_TABLE_ID0;
 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
 		struct event_data_t event_data;
-		int used = g_syscall_table[table_index].flags & UF_USED;
-		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+		int used = cur_g_syscall_table[table_index].flags & UF_USED;
+		enum syscall_flags drop_flags = cur_g_syscall_table[table_index].flags;
 		enum ppm_event_type type;
 
-#ifdef __NR_socketcall
-		if (id == __NR_socketcall) {
+#ifdef _HAS_SOCKETCALL
+		if (id == socketcall_syscall) {
 			used = true;
 			drop_flags = UF_NEVER_DROP;
 			type = PPME_GENERIC_X;
 		} else
-			type = g_syscall_table[table_index].exit_event_type;
+			type = cur_g_syscall_table[table_index].exit_event_type;
 #else
-		type = g_syscall_table[table_index].exit_event_type;
+		type = cur_g_syscall_table[table_index].exit_event_type;
 #endif
 
 		event_data.category = PPMC_SYSCALL;
 		event_data.event_info.syscall_data.regs = regs;
 		event_data.event_info.syscall_data.id = id;
+		event_data.event_info.syscall_data.cur_g_syscall_code_routing_table = cur_g_syscall_code_routing_table;
+		event_data.socketcall_syscall = socketcall_syscall;
+		event_data.compat = compat;
 
 		if (used)
 			record_event_all_consumers(type, drop_flags, &event_data);
@@ -1471,7 +1736,11 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
 {
 	struct event_data_t event_data;
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	if (unlikely(current->flags & PF_KTHREAD)) {
+#else
+	if (unlikely(current->flags & PF_BORROWED_MM)) {
+#endif
 		/*
 		 * We are not interested in kernel threads
 		 */
@@ -1492,11 +1761,14 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
 #ifdef CAPTURE_CONTEXT_SWITCHES
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35))
 TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, struct task_struct *next)
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(4, 4, 0))
 TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next)
+#else
+TRACEPOINT_PROBE(sched_switch_probe, bool preempt, struct task_struct *prev, struct task_struct *next)
 #endif
 {
 	struct event_data_t event_data;
+
 	event_data.category = PPMC_CONTEXT_SWITCH;
 	event_data.event_info.context_data.sched_prev = prev;
 	event_data.event_info.context_data.sched_next = next;
@@ -1509,6 +1781,7 @@ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struc
 TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka)
 {
 	struct event_data_t event_data;
+
 	event_data.category = PPMC_SIGNAL;
 	event_data.event_info.signal_data.sig = sig;
 	event_data.event_info.signal_data.info = info;
@@ -1653,6 +1926,7 @@ static int get_tracepoint_handles(void)
 }
 #endif
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 3, 0)
 static char *ppm_devnode(struct device *dev, umode_t *mode)
 #else
@@ -1669,6 +1943,71 @@ static char *ppm_devnode(struct device *dev, mode_t *mode)
 
 	return NULL;
 }
+#endif /* LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20) */
+
+/*
+ * This gets called every time a CPU is added or removed
+ */
+static int cpu_callback(struct notifier_block *self, unsigned long action,
+			void *hcpu)
+{
+	long cpu = (long)hcpu;
+	struct ppm_ring_buffer_context *ring;
+	struct ppm_consumer_t *consumer;
+	bool event_recorded = false;
+	struct timespec ts;
+	struct event_data_t event_data;
+	long sd_action = 0;
+
+	switch (action) {
+	case CPU_UP_PREPARE:
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
+	case CPU_UP_PREPARE_FROZEN:
+#endif
+		sd_action = 1;
+		break;
+	case CPU_DOWN_PREPARE:
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
+	case CPU_DOWN_PREPARE_FROZEN:
+#endif
+		sd_action = 2;
+		break;
+	default:
+		break;
+	}
+
+	/*
+	 * Based on the action, spit an event in the first available ring
+	 */
+	if (sd_action != 0) {
+		rcu_read_lock();
+
+		list_for_each_entry_rcu(consumer, &g_consumer_list, node) {
+			ring = per_cpu_ptr(consumer->ring_buffers, cpu);
+			ring->capture_enabled = false;
+
+			getnstimeofday(&ts);
+
+			event_data.category = PPMC_CONTEXT_SWITCH;
+			event_data.event_info.context_data.sched_prev = (void *)cpu;
+			event_data.event_info.context_data.sched_next = (void *)sd_action;
+
+			if (!event_recorded) {
+				record_event_consumer(consumer, PPME_CPU_HOTPLUG_E, UF_NEVER_DROP, &ts, &event_data);
+				event_recorded = true;
+			}
+		}
+
+		rcu_read_unlock();
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block cpu_notifier = {
+	.notifier_call = &cpu_callback,
+	.next = NULL,
+};
 
 int sysdig_init(void)
 {
@@ -1679,16 +2018,19 @@ int sysdig_init(void)
 	int acrret = 0;
 	int j;
 	int n_created_devices = 0;
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	struct device *device = NULL;
-
-	pr_info("driver loading\n");
+#else
+	struct class_device *device = NULL;
+#endif
+	pr_info("driver loading, " PROBE_NAME " " PROBE_VERSION "\n");
 
 	ret = get_tracepoint_handles();
 	if (ret < 0)
 		goto init_module_err;
 
 	num_cpus = 0;
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		++num_cpus;
 	}
 
@@ -1696,25 +2038,31 @@ int sysdig_init(void)
 	 * Initialize the user I/O
 	 * ( + 1 for sysdig-events)
 	 */
-	acrret = alloc_chrdev_region(&dev, 0, num_cpus + 1, PPM_DEVICE_NAME);
+	acrret = alloc_chrdev_region(&dev, 0, num_cpus + 1, PROBE_DEVICE_NAME);
 	if (acrret < 0) {
-		pr_err("could not allocate major number for %s\n", PPM_DEVICE_NAME);
+		pr_err("could not allocate major number for %s\n", PROBE_DEVICE_NAME);
 		ret = -ENOMEM;
 		goto init_module_err;
 	}
 
-	g_ppm_class = class_create(THIS_MODULE, PPM_DEVICE_NAME);
+	g_ppm_class = class_create(THIS_MODULE, PROBE_DEVICE_NAME);
 	if (IS_ERR(g_ppm_class)) {
 		pr_err("can't allocate device class\n");
 		ret = -EFAULT;
 		goto init_module_err;
 	}
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	g_ppm_class->devnode = ppm_devnode;
+#endif
 
 	g_ppm_major = MAJOR(dev);
 	g_ppm_numdevs = num_cpus;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 	g_ppm_devs = kmalloc(g_ppm_numdevs * sizeof(struct ppm_device), GFP_KERNEL);
+#else	
+	g_ppm_devs = kmalloc_array(g_ppm_numdevs, sizeof(struct ppm_device), GFP_KERNEL);
+#endif
 	if (!g_ppm_devs) {
 		pr_err("can't allocate devices\n");
 		ret = -ENOMEM;
@@ -1729,19 +2077,24 @@ int sysdig_init(void)
 		g_ppm_devs[j].dev = MKDEV(g_ppm_major, j);
 
 		if (cdev_add(&g_ppm_devs[j].cdev, g_ppm_devs[j].dev, 1) < 0) {
-			pr_err("could not allocate chrdev for %s\n", PPM_DEVICE_NAME);
+			pr_err("could not allocate chrdev for %s\n", PROBE_DEVICE_NAME);
 			ret = -EFAULT;
 			goto init_module_err;
 		}
 
-		device = device_create(g_ppm_class, NULL, /* no parent device */
-				       g_ppm_devs[j].dev,
-				       NULL, /* no additional data */
-				       PPM_DEVICE_NAME "%d",
-				       j);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
+		device = device_create(
+#else
+		device = class_device_create(
+#endif
+						g_ppm_class, NULL, /* no parent device */
+						g_ppm_devs[j].dev,
+						NULL, /* no additional data */
+						PROBE_DEVICE_NAME "%d",
+						j);
 
 		if (IS_ERR(device)) {
-			pr_err("error creating the device for  %s\n", PPM_DEVICE_NAME);
+			pr_err("error creating the device for  %s\n", PROBE_DEVICE_NAME);
 			cdev_del(&g_ppm_devs[j].cdev);
 			ret = -EFAULT;
 			goto init_module_err;
@@ -1753,40 +2106,20 @@ int sysdig_init(void)
 
 	/* create_proc_read_entry(PPM_DEVICE_NAME, 0, NULL, ppm_read_proc, NULL); */
 
-	g_ppe_cdev = cdev_alloc();
-	if (g_ppe_cdev == NULL) {
-		pr_err("error allocating the device %s\n", PPE_DEVICE_NAME);
-		ret = -ENOMEM;
-		goto init_module_err;
-	}
-
-	cdev_init(g_ppe_cdev, &g_ppe_fops);
-
-	if (cdev_add(g_ppe_cdev, MKDEV(g_ppm_major, g_ppm_numdevs), 1) < 0) {
-		pr_err("could not allocate chrdev for %s\n", PPE_DEVICE_NAME);
-		ret = -EFAULT;
-		goto init_module_err;
-	}
-
-	g_ppe_dev = device_create(g_ppm_class, NULL,
-			MKDEV(g_ppm_major, g_ppm_numdevs),
-			NULL, /* no additional data */
-			PPE_DEVICE_NAME);
-
-	if (IS_ERR(g_ppe_dev)) {
-		pr_err("error creating the device for  %s\n", PPE_DEVICE_NAME);
+	/*
+	 * Snaplen lookahead initialization
+	 */
+	if (dpi_lookahead_init() != PPM_SUCCESS) {
+		pr_err("initializing lookahead-based snaplen failed\n");
 		ret = -EFAULT;
 		goto init_module_err;
 	}
 
 	/*
-	 * Snaplen lookahead initialization
+	 * Set up our callback in case we get a hotplug even while we are
+	 * initializing the cpu structures
 	 */
-	if (dpi_lookahead_init() != PPM_SUCCESS) {
-		pr_err("initializing lookahead-based snaplen  %s\n", PPE_DEVICE_NAME);
-		ret = -EFAULT;
-		goto init_module_err;
-	}
+	register_cpu_notifier(&cpu_notifier);
 
 	/*
 	 * All ok. Final initalizations.
@@ -1796,12 +2129,6 @@ int sysdig_init(void)
 	return 0;
 
 init_module_err:
-	if (g_ppe_dev != NULL)
-		device_destroy(g_ppm_class, MKDEV(g_ppm_major, g_ppm_numdevs));
-
-	if (g_ppe_cdev != NULL)
-		cdev_del(g_ppe_cdev);
-
 	for (j = 0; j < n_created_devices; ++j) {
 		device_destroy(g_ppm_class, g_ppm_devs[j].dev);
 		cdev_del(&g_ppm_devs[j].cdev);
@@ -1829,12 +2156,6 @@ void sysdig_exit(void)
 		cdev_del(&g_ppm_devs[j].cdev);
 	}
 
-	if (g_ppe_dev != NULL)
-		device_destroy(g_ppm_class, MKDEV(g_ppm_major, g_ppm_numdevs));
-
-	if (g_ppe_cdev != NULL)
-		cdev_del(g_ppe_cdev);
-
 	if (g_ppm_class)
 		class_destroy(g_ppm_class);
 
@@ -1843,12 +2164,18 @@ void sysdig_exit(void)
 
 	kfree(g_ppm_devs);
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 	tracepoint_synchronize_unregister();
+#endif
+
+	unregister_cpu_notifier(&cpu_notifier);
 }
 
 module_init(sysdig_init);
 module_exit(sysdig_exit);
 module_param(max_consumers, uint, 0444);
 MODULE_PARM_DESC(max_consumers, "Maximum number of consumers that can simultaneously open the devices");
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 module_param(verbose, bool, 0444);
+#endif
 MODULE_PARM_DESC(verbose, "Enable verbose logging");

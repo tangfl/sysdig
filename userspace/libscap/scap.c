@@ -30,6 +30,9 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #endif // _WIN32
 
 #include "scap.h"
+#ifdef HAS_CAPTURE
+#include "../../driver/driver_config.h"
+#endif // HAS_CAPTURE
 #include "../../driver/ppm_ringbuffer.h"
 #include "scap_savefile.h"
 #include "scap-int.h"
@@ -43,10 +46,16 @@ static uint32_t get_max_consumers()
 	FILE *pfile = fopen("/sys/module/sysdig_probe/parameters/max_consumers", "r");
 	if(pfile != NULL)
 	{
-		fscanf(pfile, "%"PRIu32, &max);
+		int w = fscanf(pfile, "%"PRIu32, &max);
+		if(w == 0)
+		{
+			return 0;
+		}
+		
 		fclose(pfile);
 		return max;
 	}
+
 	return 0;
 }
 
@@ -70,6 +79,8 @@ scap_t* scap_open_live_int(char *error,
 	int len;
 	uint32_t ndevs;
 	uint32_t res;
+	uint32_t max_devs;
+	uint32_t all_scanned_devs;
 
 	//
 	// Allocate the handle
@@ -90,6 +101,7 @@ scap_t* scap_open_live_int(char *error,
 	// Find out how many devices we have to open, which equals to the number of CPUs
 	//
 	ndevs = sysconf(_SC_NPROCESSORS_ONLN);
+	max_devs = sysconf(_SC_NPROCESSORS_CONF);	
 
 	//
 	// Allocate the device descriptors.
@@ -124,6 +136,7 @@ scap_t* scap_open_live_int(char *error,
 	handle->m_machine_info.reserved2 = 0;
 	handle->m_machine_info.reserved3 = 0;
 	handle->m_machine_info.reserved4 = 0;
+	handle->m_driver_procinfo = NULL;
 
 	//
 	// Create the interface list
@@ -158,27 +171,35 @@ scap_t* scap_open_live_int(char *error,
 	snprintf(handle->m_fake_kernel_proc.comm, SCAP_MAX_PATH_SIZE, "kernel");
 	snprintf(handle->m_fake_kernel_proc.exe, SCAP_MAX_PATH_SIZE, "kernel");
 	handle->m_fake_kernel_proc.args[0] = 0;
+	handle->refresh_proc_table_when_saving = true;
 
 	//
 	// Open and initialize all the devices
 	//
-	for(j = 0; j < handle->m_ndevs; j++)
+	for(j = 0, all_scanned_devs = 0; j < handle->m_ndevs && all_scanned_devs < max_devs; all_scanned_devs++)
 	{
 		//
 		// Open the device
 		//
-		sprintf(filename, "%s/dev/sysdig%d", scap_get_host_root(), j);
+		sprintf(filename, "%s/dev/" PROBE_DEVICE_NAME "%d", scap_get_host_root(), all_scanned_devs);
 
 		if((handle->m_devs[j].m_fd = open(filename, O_RDWR | O_SYNC)) < 0)
 		{
-			if(errno == EBUSY)
+			if(errno == ENODEV)
+			{
+				//
+				// This CPU is offline, so we just skip it
+				//
+				continue;
+			}
+			else if(errno == EBUSY)
 			{
 				uint32_t curr_max_consumers = get_max_consumers();
 				snprintf(error, SCAP_LASTERR_SIZE, "Too many sysdig instances attached to device %s. Current value for /sys/module/sysdig_probe/parameters/max_consumers is '%"PRIu32"'.", filename, curr_max_consumers);
 			}
 			else
 			{
-				snprintf(error, SCAP_LASTERR_SIZE, "error opening device %s. Make sure you have root credentials and that the sysdig-probe module is loaded.", filename);
+				snprintf(error, SCAP_LASTERR_SIZE, "error opening device %s. Make sure you have root credentials and that the " PROBE_NAME " module is loaded.", filename);
 			}
 
 			scap_close(handle);
@@ -235,6 +256,7 @@ scap_t* scap_open_live_int(char *error,
 		handle->m_devs[j].m_sn_len = 0;
 		handle->m_n_consecutive_waits = 0;
 		scap_stop_dropping_mode(handle);
+		j++;
 	}
 
 	//
@@ -290,6 +312,8 @@ scap_t* scap_open_offline_int(const char* fname,
 	handle->m_userlist = NULL;
 	handle->m_machine_info.num_cpus = (uint32_t)-1;
 	handle->m_last_evt_dump_flags = 0;
+	handle->m_driver_procinfo = NULL;
+	handle->refresh_proc_table_when_saving = true;
 
 	handle->m_file_evt_buf = (char*)malloc(FILE_READ_BUF_SIZE);
 	if(!handle->m_file_evt_buf)
@@ -854,6 +878,33 @@ static int32_t scap_set_dropping_mode(scap_t* handle, int request, uint32_t samp
 }
 #endif
 
+#if defined(HAS_CAPTURE)
+int32_t scap_enable_tracers_capture(scap_t* handle)
+{
+	//	
+	// Not supported for files
+	//
+	if(handle->m_file)
+	{
+		snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "scap_set_inode_of_dev_null not supported on offline captures");
+		ASSERT(false);
+		return SCAP_FAILURE;
+	}
+
+	if(handle->m_ndevs)
+	{
+		if(ioctl(handle->m_devs[0].m_fd, PPM_IOCTL_SET_TRACERS_CAPTURE))
+		{
+			snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "%s failed", __FUNCTION__);
+			ASSERT(false);
+			return SCAP_FAILURE;
+		}		
+	}
+
+	return SCAP_SUCCESS;
+}
+#endif
+
 int32_t scap_stop_dropping_mode(scap_t* handle)
 {
 #if !defined(HAS_CAPTURE)
@@ -1128,4 +1179,88 @@ const char* scap_get_host_root()
 	}
 
 	return p;
+}
+
+bool alloc_proclist_info(scap_t* handle, uint32_t n_entries)
+{
+	uint32_t memsize;
+
+	if(n_entries >= SCAP_DRIVER_PROCINFO_MAX_SIZE)
+	{
+		snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "driver process list too big");
+		return false;
+	}
+
+	memsize = sizeof(struct ppm_proclist_info) + 
+	sizeof(struct ppm_proc_info) * n_entries;
+
+	if(handle->m_driver_procinfo != NULL)
+	{
+		free(handle->m_driver_procinfo);
+	}
+
+	handle->m_driver_procinfo = (struct ppm_proclist_info*)malloc(memsize);
+	if(handle->m_driver_procinfo == NULL)
+	{
+		snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "driver process list allocation error");
+		return false;
+	}
+
+	handle->m_driver_procinfo->max_entries = n_entries;
+	handle->m_driver_procinfo->n_entries = 0;
+
+	return true;
+}
+
+struct ppm_proclist_info* scap_get_threadlist_from_driver(scap_t* handle)
+{
+	//
+	// Not supported on files
+	//
+	if(handle->m_file)
+	{
+		snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "scap_get_threadlist_from_driver not supported on offline captures");
+		return NULL;
+	}
+
+#if !defined(HAS_CAPTURE)
+	snprintf(handle->m_lasterr, SCAP_LASTERR_SIZE, "live capture not supported on %s", PLATFORM_NAME);
+	return NULL;
+#else
+	if(handle->m_driver_procinfo == NULL)
+	{
+		if(alloc_proclist_info(handle, SCAP_DRIVER_PROCINFO_INITIAL_SIZE) == false)
+		{
+			return NULL;
+		}
+	}
+
+	int ioctlres = ioctl(handle->m_devs[0].m_fd, PPM_IOCTL_GET_PROCLIST, handle->m_driver_procinfo);
+	if(ioctlres)
+	{
+		if(errno == ENOSPC)
+		{
+			if(alloc_proclist_info(handle, handle->m_driver_procinfo->n_entries + 256) == false)
+			{
+				return NULL;
+			}
+			else
+			{
+				return scap_get_threadlist_from_driver(handle);
+			}
+		}
+		else
+		{
+			snprintf(handle->m_lasterr,	SCAP_LASTERR_SIZE, "Error calling PPM_IOCTL_GET_PROCLIST");
+			return NULL;
+		}
+	}
+
+	return handle->m_driver_procinfo;
+#endif	// HAS_CAPTURE
+}
+
+void scap_set_refresh_proc_table_when_saving(scap_t* handle, bool refresh)
+{
+	handle->refresh_proc_table_when_saving = refresh;
 }

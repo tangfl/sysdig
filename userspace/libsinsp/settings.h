@@ -16,6 +16,7 @@ You should have received a copy of the GNU General Public License
 along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#pragma once
 //
 // This flag can be used to include unsupported or unrecognized sockets
 // in the fd tables. It's useful to debug close() leaks
@@ -24,7 +25,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 
 //
 // Memory storage size for an entry in the event storage LIFO.
-// Events bigger than SP_STORAGE_EVT_BUF_SIZE won't be be stored in the LIFO.
+// Events bigger than SP_EVT_BUF_SIZE won't be be stored in the LIFO.
 //
 #define SP_EVT_BUF_SIZE 4096
 
@@ -53,12 +54,12 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 //
 // Max size that the thread table can reach
 //
-#define MAX_THREAD_TABLE_SIZE 65536
+#define MAX_THREAD_TABLE_SIZE 32768
 
 //
 // Max size that the FD table of a process can reach
 //
-#define MAX_FD_TABLE_SIZE 2048
+#define MAX_FD_TABLE_SIZE 4096
 
 //
 // The time after an inactive thread is removed.
@@ -91,6 +92,35 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #define DEFAULT_SNAPLEN 80
 
 //
+// Maximum user event buffer size
+//
+#define MAX_USER_EVT_BUFFER 65536
+
+//
+// Size the user event buffer is brought back once in a while 
+//
+#define MIN_USER_EVT_BUFFER 256
+ 
+//
+// Is csysdig functionality included?
+//
+#define CSYSDIG
+
+#ifdef _WIN32
+#define NOCURSESUI
+#endif
+
+//
+// Name of the device used for tracer injection
+//
+#define USER_EVT_DEVICE_NAME "/dev/null"
+
+//
+// For internal use
+//
+#define FALCOBL_FULL_PROCESSING
+
+//
 // FD class customized with the storage we need
 //
 #ifdef HAS_ANALYZER
@@ -99,3 +129,8 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 template<class T> class sinsp_fdinfo;
 typedef sinsp_fdinfo<int> sinsp_fdinfo_t;
 #endif // HAS_ANALYZER
+
+// Max JSON we can parse from docker API or others
+// Added because older docker versions have a bug that causes
+// very big JSONs returned by container inspect call
+static const unsigned MAX_JSON_SIZE_B = 500 * 1024; // 500 kiB

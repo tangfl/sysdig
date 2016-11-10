@@ -56,6 +56,7 @@ int32_t scap_proc_fill_info_from_stats(char* procdirname, struct scap_threadinfo
 	int64_t tmp;
 	uint32_t uid;
 	uint64_t ppid;
+	int64_t sid;
 	uint32_t vmsize_kb;
 	uint32_t vmrss_kb;
 	uint32_t vmswap_kb;
@@ -67,11 +68,13 @@ int32_t scap_proc_fill_info_from_stats(char* procdirname, struct scap_threadinfo
 
 	tinfo->uid = (uint32_t)-1;
 	tinfo->ptid = (uint32_t)-1LL;
+	tinfo->sid = 0;
 	tinfo->vmsize_kb = 0;
 	tinfo->vmrss_kb = 0;
 	tinfo->vmswap_kb = 0;
 	tinfo->pfmajor = 0;
 	tinfo->pfminor = 0;
+	tinfo->filtered_out = 0;
 
 	snprintf(filename, sizeof(filename), "%sstatus", procdirname);
 
@@ -194,7 +197,7 @@ int32_t scap_proc_fill_info_from_stats(char* procdirname, struct scap_threadinfo
 	{
 		ASSERT(false);
 		fclose(f);
-		return SCAP_FAILURE;		
+		return SCAP_FAILURE;
 	}
 
 	//
@@ -203,7 +206,7 @@ int32_t scap_proc_fill_info_from_stats(char* procdirname, struct scap_threadinfo
 	if(sscanf(s + 2, "%c %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64,
 		&tmpc,
 		&tmp,
-		&tmp,
+		&sid,
 		&tmp,
 		&tmp,
 		&tmp,
@@ -219,6 +222,7 @@ int32_t scap_proc_fill_info_from_stats(char* procdirname, struct scap_threadinfo
 
 	tinfo->pfmajor = pfmajor;
 	tinfo->pfminor = pfminor;
+	tinfo->sid = (uint64_t) sid;
 
 	fclose(f);
 	return SCAP_SUCCESS;
@@ -324,7 +328,7 @@ int32_t scap_proc_fill_cgroups(struct scap_threadinfo* tinfo, const char* procdi
 			}
 
 			snprintf(tinfo->cgroups + tinfo->cgroups_len, SCAP_MAX_CGROUPS_SIZE - tinfo->cgroups_len, "%s=%s", token, cgroup);
-			tinfo->cgroups_len += strlen(cgroup) + 1 + strlen(token) + 1;			
+			tinfo->cgroups_len += strlen(cgroup) + 1 + strlen(token) + 1;
 		}
 	}
 
@@ -403,7 +407,21 @@ int32_t scap_getpid_global(scap_t* handle, int64_t* pid)
 	}
 
 	return SCAP_SUCCESS;
-#endif	
+#endif
+}
+
+int32_t scap_proc_fill_root(struct scap_threadinfo* tinfo, const char* procdirname)
+{
+	char root_path[SCAP_MAX_PATH_SIZE];
+	snprintf(root_path, sizeof(root_path), "%sroot", procdirname);
+	if ( readlink(root_path, tinfo->root, sizeof(tinfo->root)) > 0)
+	{
+		return SCAP_SUCCESS;
+	}
+	else
+	{
+		return SCAP_FAILURE;
+	}
 }
 
 //
@@ -640,17 +658,27 @@ static int32_t scap_proc_add_from_proc(scap_t* handle, uint32_t tid, int parentt
 	{
 		snprintf(error, SCAP_LASTERR_SIZE, "can't fill cgroups for %" PRIu64, tinfo->tid);
 		free(tinfo);
-		return SCAP_FAILURE;	
+		return SCAP_FAILURE;
 	}
 
 	if(scap_get_vtid(handle, tinfo->tid, &tinfo->vtid) == SCAP_FAILURE)
 	{
-		tinfo->vtid = -1;
+		tinfo->vtid = tinfo->tid;
 	}
 
 	if(scap_get_vpid(handle, tinfo->tid, &tinfo->vpid) == SCAP_FAILURE)
 	{
-		tinfo->vpid = -1;
+		tinfo->vpid = tinfo->pid;
+	}
+
+	//
+	// set the current root of the process
+	//
+	if(SCAP_FAILURE == scap_proc_fill_root(tinfo, dir_name))
+	{
+		snprintf(error, SCAP_LASTERR_SIZE, "can't fill root for %s", dir_name);
+		free(tinfo);
+		return SCAP_FAILURE;
 	}
 
 	//
@@ -681,7 +709,7 @@ static int32_t scap_proc_add_from_proc(scap_t* handle, uint32_t tid, int parentt
 	{
 		*procinfo = tinfo;
 	}
-	
+
 	//
 	// Only add fds for processes, not threads
 	//
@@ -892,12 +920,12 @@ bool scap_is_thread_alive(scap_t* handle, int64_t pid, int64_t tid, const char* 
 	char charbuf[SCAP_MAX_PATH_SIZE];
 	FILE* f;
 
+
 	//
 	// No /proc parsing for offline captures
 	//
 	if(handle->m_file)
 	{
-		ASSERT(false);
 		return false;
 	}
 
@@ -917,6 +945,22 @@ bool scap_is_thread_alive(scap_t* handle, int64_t pid, int64_t tid, const char* 
 		}
 
 		fclose(f);
+	}
+	else
+	{
+		//
+		// If /proc/<pid>/task/<tid>/comm does not exist but /proc/<pid>/task/<tid>/exe does exist, we assume we're on an ancient
+		// OS like RHEL5 and we return true.
+		// This could generate some false positives on such old distros, and we're going to accept it.
+		//
+		snprintf(charbuf, sizeof(charbuf), "%s/proc/%" PRId64 "/task/%" PRId64 "/exe", scap_get_host_root(), pid, tid);
+		f = fopen(charbuf, "r");
+		if(f != NULL)
+		{
+			fclose(f);
+			return true;
+		}
+
 	}
 
 	return false;

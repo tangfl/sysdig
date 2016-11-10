@@ -38,7 +38,14 @@ void sinsp_ipv4_ifinfo::convert_to_string(char * dest, const uint32_t addr)
 		((addr & 0xFF000000) >> 24));
 }
 
-string sinsp_ipv4_ifinfo::to_string()
+string sinsp_ipv4_ifinfo::address() const
+{
+	char str_addr[16];
+	convert_to_string(str_addr, m_addr);
+	return string(str_addr);
+}
+
+string sinsp_ipv4_ifinfo::to_string() const
 {
 	char s[100];
 	char str_addr[16];
@@ -159,8 +166,52 @@ bool sinsp_network_interfaces::is_ipv4addr_in_subnet(uint32_t addr)
 	return false;
 }
 
-bool sinsp_network_interfaces::is_ipv4addr_in_local_machine(uint32_t addr)
+bool sinsp_network_interfaces::is_ipv4addr_in_local_machine(uint32_t addr, sinsp_threadinfo* tinfo)
 {
+	if(!tinfo->m_container_id.empty())
+	{
+		sinsp_container_info container_info;
+		bool found = m_inspector->m_container_manager.get_container(tinfo->m_container_id, &container_info);
+
+		//
+		// Note: if we don't have container info, any pick we make is arbitrary.
+		// To at least achieve consistency across client and server, we just match the host interface addresses. 
+		//
+		if(found)
+		{
+			if(container_info.m_container_ip != 0)
+			{
+				//
+				// We have a container info with a valid container IP. Let's use it.
+				//
+				if(addr == container_info.m_container_ip)
+				{
+					return true;
+				}
+			}
+			else
+			{
+				//
+				// Container info is valid, but the IP address is zero.
+				// This happens for example in the case of kubernetes pods, where we are
+				// typically unable to get the address for one of the containers in the pod.
+				// In that case, the address can be fetched from another of the containers
+				// in the pod, so we scan the list looking for matches. If no match is found,
+				// We just jump to checking the host interfaces.
+				//
+				const unordered_map<string, sinsp_container_info>* clist = m_inspector->m_container_manager.get_containers();
+
+				for(auto it = clist->begin(); it != clist->end(); ++it)
+				{
+					if(it->second.m_container_ip == addr)
+					{
+						return true;
+					}
+				}
+			}
+		}
+	}
+
 	vector<sinsp_ipv4_ifinfo>::iterator it;
 
 	// try to find an interface that has the given IP as address
@@ -215,8 +266,7 @@ void sinsp_network_interfaces::import_interfaces(scap_addrlist* paddrlist)
 {
 	if(NULL != paddrlist)
 	{
-		m_ipv4_interfaces.clear();
-		m_ipv6_interfaces.clear();
+		clear();
 		import_ipv4_ifaddr_list(paddrlist->n_v4_addrs, paddrlist->v4list);
 		import_ipv6_ifaddr_list(paddrlist->n_v6_addrs, paddrlist->v6list);
 	}

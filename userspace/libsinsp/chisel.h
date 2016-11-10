@@ -22,6 +22,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 
 class sinsp_filter_check;
 class sinsp_evt_formatter;
+class sinsp_view_info;
 
 typedef struct lua_State lua_State;
 
@@ -73,8 +74,8 @@ public:
 	string m_category;
 	string m_shortdesc;
 	vector<chiselarg_desc> m_args;
+	sinsp_view_info m_viewinfo;
 };
-
 
 class chiselinfo
 {
@@ -105,12 +106,18 @@ public:
 	static void add_lua_package_path(lua_State* ls, const char* path);
 	static void get_chisel_list(vector<chisel_desc>* chisel_descs);
 	void load(string cmdstr);
+	string get_name()
+	{
+		return m_filename;
+	}
 	uint32_t get_n_args();
 	uint32_t get_n_optional_args();
 	uint32_t get_n_required_args();
 	void set_args(string args);
+	void set_args(vector<pair<string, string>> args);
 	bool run(sinsp_evt* evt);
 	void do_timeout(sinsp_evt* evt);
+	void do_end_of_sample();
 	void on_init();
 	void on_capture_start();
 	void on_capture_end();
@@ -123,6 +130,12 @@ public:
 private:
 	bool openfile(string filename, OUT ifstream* is);
 	void free_lua_chisel();
+	static sinsp_field_aggregation string_to_aggregation(string ag);
+	static void parse_view_column(lua_State *ls, OUT chisel_desc* cd, OUT void* columns);
+	static void parse_view_columns(lua_State *ls, OUT chisel_desc* cd, OUT void* columns);
+	static void parse_view_action(lua_State *ls, OUT chisel_desc* cd, OUT void* actions);
+	static void parse_view_actions(lua_State *ls, OUT chisel_desc* cd, OUT void* actions);
+	static bool parse_view_info(lua_State *ls, OUT chisel_desc* cd);
 	static bool init_lua_chisel(chisel_desc &cd, string const &path);
 	void first_event_inits(sinsp_evt* evt);
 
@@ -137,9 +150,11 @@ private:
 	uint64_t m_lua_last_interval_sample_time;
 	uint64_t m_lua_last_interval_ts;
 	vector<sinsp_filter_check*> m_allocated_fltchecks;
-	char m_lua_fld_storage[1024];
+	char m_lua_fld_storage[16384];
 	chiselinfo* m_lua_cinfo;
 	string m_new_chisel_to_exec;
+	int m_udp_socket;
+	struct sockaddr_in m_serveraddr;
 
 	friend class lua_cbacks;
 };

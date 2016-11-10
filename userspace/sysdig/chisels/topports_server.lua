@@ -15,7 +15,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 --]]
 
 -- Chisel description
-description = "Shows the top TCP/UDP server ports in terms of total (in+out) bandwidth. This chisel is compatable with containers using the sysdig -pc or -pcontainer argument, otherwise no container information will be shown.";
+description = "Shows the top TCP/UDP server ports in terms of total (in+out) bandwidth. This chisel is compatible with containers using the sysdig -pc or -pcontainer argument, otherwise no container information will be shown.";
 short_description = "Top TCP/UDP server ports by R+W bytes";
 category = "Net";
 
@@ -37,7 +37,7 @@ function on_init()
 
 	if print_container then
 		chisel.exec("table_generator",
-					"fd.sport,container.name",
+					"fd.sproto,container.name",
 					"Srv Port,container.name",
 					"evt.rawarg.res",
 					"Bytes",
@@ -46,7 +46,7 @@ function on_init()
 					"bytes")
 	else
 		chisel.exec("table_generator",
-					"fd.sport",
+					"fd.sproto",
 					"Srv Port",
 					"evt.rawarg.res",
 					"Bytes",

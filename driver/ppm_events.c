@@ -19,10 +19,11 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #define pr_fmt(fmt)	KBUILD_MODNAME ": " fmt
 
 #include <linux/compat.h>
+#include <linux/kobject.h>
 #include <linux/cdev.h>
-#include <asm/syscall.h>
 #include <net/sock.h>
 #include <net/af_unix.h>
+#include <net/compat.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -34,19 +35,19 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <asm/mman.h>
+#include <linux/in.h>
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2, 6, 20)
+#include <linux/mount.h>
+#include "ppm_syscall.h"
+#else
+#include <asm/syscall.h>
+#endif
 
 #include "ppm_ringbuffer.h"
 #include "ppm_events_public.h"
 #include "ppm_events.h"
 #include "ppm.h"
 
-/*
- * do-nothing implementation of compat_ptr for systems that are not compiled
- * with CONFIG_COMPAT.
- */
-#ifndef CONFIG_COMPAT
-#define compat_ptr(X) X
-#endif
 
 /*
  * The kernel patched with grsecurity makes the default access_ok trigger a
@@ -57,6 +58,8 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #else
 #define ppm_access_ok access_ok
 #endif
+
+extern bool g_tracers_enabled;
 
 static void memory_dump(char *p, size_t size)
 {
@@ -184,13 +187,12 @@ inline u32 compute_snaplen(struct event_filler_arguments *args, char *buf, u32 l
 	int peer_address_len;
 	u16 sport, dport;
 
-/*
-	if (args->event_type == PPME_SYSCALL_WRITE_X) {
+	if (g_tracers_enabled && args->event_type == PPME_SYSCALL_WRITE_X) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 		struct fd f = fdget(args->fd);
 
-		if (f.file && f.file->f_op) {
-			if (THIS_MODULE == f.file->f_op->owner) {
+		if (f.file && f.file->f_inode) {
+			if (f.file->f_inode->i_rdev == PPM_NULL_RDEV) {
 				res = RW_SNAPLEN_EVENT;
 				fdput(f);
 				return res;
@@ -200,8 +202,16 @@ inline u32 compute_snaplen(struct event_filler_arguments *args, char *buf, u32 l
 		}
 #else
 		struct file* file = fget(args->fd);
-		if (file && file->f_op) {
-			if (THIS_MODULE == file->f_op->owner) {
+		/* Use cached f_inode only on kernel versions that have it
+		 * https://github.com/torvalds/linux/commit/dd37978c50bc8b354e5c4633f69387f16572fdac
+		 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
+		if (file && file->f_inode) {
+			if (file->f_inode->i_rdev == PPM_NULL_RDEV) {
+#else
+		if (file && file->f_path.dentry && file->f_path.dentry->d_inode) {
+			if (file->f_path.dentry->d_inode->i_rdev == PPM_NULL_RDEV) {
+#endif
 				res = RW_SNAPLEN_EVENT;
 				fput(file);
 				return res;
@@ -211,7 +221,6 @@ inline u32 compute_snaplen(struct event_filler_arguments *args, char *buf, u32 l
 		}
 #endif
 	}
-*/
 
 	if (!args->consumer->do_dynamic_snaplen)
 		return res;
@@ -224,7 +233,100 @@ inline u32 compute_snaplen(struct event_filler_arguments *args, char *buf, u32 l
 			err = sock->ops->getname(sock, (struct sockaddr *)&sock_address, &sock_address_len, 0);
 
 			if (err == 0) {
-				err = sock->ops->getname(sock, (struct sockaddr *)&peer_address, &peer_address_len, 1);
+				if(args->event_type == PPME_SOCKET_SENDTO_X)
+				{
+					unsigned long val;
+					struct sockaddr __user * usrsockaddr;
+					/*
+					 * Get the address
+					 */
+					if (!args->is_socketcall)
+						syscall_get_arguments(current, args->regs, 4, 1, &val);
+					else
+						val = args->socketcall_args[4];
+
+					usrsockaddr = (struct sockaddr __user *)val;
+
+					if(usrsockaddr == NULL) {
+						/*
+						 * Suppose is a connected socket, fall back to fd
+						 */
+						err = sock->ops->getname(sock, (struct sockaddr *)&peer_address, &peer_address_len, 1);
+					} else {
+						/*
+						 * Get the address len
+						 */
+						if (!args->is_socketcall)
+							syscall_get_arguments(current, args->regs, 5, 1, &val);
+						else
+							val = args->socketcall_args[5];
+
+						if (val != 0) {
+							peer_address_len = val;
+							/*
+							 * Copy the address
+							 */
+							err = addr_to_kernel(usrsockaddr, val, (struct sockaddr *)&peer_address);
+						} else {
+							/*
+							 * This case should be very rare, fallback again to sock
+							 */
+							err = sock->ops->getname(sock, (struct sockaddr *)&peer_address, &peer_address_len, 1);
+						}
+					}
+				} else if (args->event_type == PPME_SOCKET_SENDMSG_X) {
+					unsigned long val;
+					struct sockaddr __user * usrsockaddr;
+					int addrlen;
+#ifdef CONFIG_COMPAT
+					struct compat_msghdr compat_mh;
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+					struct user_msghdr mh;
+#else
+					struct msghdr mh;
+#endif
+
+					if (!args->is_socketcall)
+						syscall_get_arguments(current, args->regs, 1, 1, &val);
+					else
+						val = args->socketcall_args[1];
+
+#ifdef CONFIG_COMPAT
+					if (!args->compat) {
+#endif
+						if (unlikely(ppm_copy_from_user(&mh, (const void __user *)val, sizeof(mh)))) {
+							usrsockaddr = NULL;
+							addrlen = 0;
+						} else {
+							usrsockaddr = (struct sockaddr __user *)mh.msg_name;
+							addrlen = mh.msg_namelen;
+						}
+#ifdef CONFIG_COMPAT
+					} else {
+						if (unlikely(ppm_copy_from_user(&compat_mh, (const void __user *)compat_ptr(val), sizeof(compat_mh)))) {
+							usrsockaddr = NULL;
+							addrlen = 0;
+						} else {
+							usrsockaddr = (struct sockaddr __user *)compat_ptr(compat_mh.msg_name);
+							addrlen = compat_mh.msg_namelen;
+						}
+					}
+#endif
+
+					if (usrsockaddr != NULL && addrlen != 0) {
+						peer_address_len = addrlen;
+						/*
+						 * Copy the address
+						 */
+						err = addr_to_kernel(usrsockaddr, peer_address_len, (struct sockaddr *)&peer_address);
+					} else
+						/*
+						 * Suppose it is a connected socket, fall back to fd
+						 */
+						err = sock->ops->getname(sock, (struct sockaddr *)&peer_address, &peer_address_len, 1);
+				} else
+					err = sock->ops->getname(sock, (struct sockaddr *)&peer_address, &peer_address_len, 1);
 
 				if (err == 0) {
 					family = sock->sk->sk_family;
@@ -254,24 +356,27 @@ inline u32 compute_snaplen(struct event_filler_arguments *args, char *buf, u32 l
 						if (lookahead_size >= 2) {
 							if ((buf[0] == 'Q' && buf[1] == 0) || /* SimpleQuery command */
 								(buf[0] == 'P' && buf[1] == 0) || /* Prepare statement commmand */
-								 (buf[4] == 0 && buf[5] == 3 && buf[6] == 0) || /* startup command */
-								 (buf[0] == 'E' && buf[1] == 0) /* error or execute command */
+								(buf[4] == 0 && buf[5] == 3 && buf[6] == 0) || /* startup command */
+								(buf[0] == 'E' && buf[1] == 0) /* error or execute command */
 							) {
 								sockfd_put(sock);
 								return 2000;
 							}
 						}
-					} else if (( lookahead_size >= 4 && buf[1] == 0 && buf[2] == 0 && buf[2] == 0) || /* matches command */
-							   (lookahead_size >= 16 && ( *(int32_t*)(buf+12) == 1 || /* matches header */
-									   *(int32_t*)(buf+12) == 2001 ||
-									   *(int32_t*)(buf+12) == 2002 ||
-									   *(int32_t*)(buf+12) == 2003 ||
-									   *(int32_t*)(buf+12) == 2004 ||
-									   *(int32_t*)(buf+12) == 2005 ||
-									   *(int32_t*)(buf+12) == 2006 ||
-									   *(int32_t*)(buf+12) == 2007 )
+					} else if ((lookahead_size >= 4 && buf[1] == 0 && buf[2] == 0 && buf[2] == 0) || /* matches command */
+								(lookahead_size >= 16 && (*(int32_t *)(buf+12) == 1 || /* matches header */
+									*(int32_t *)(buf+12) == 2001 ||
+									*(int32_t *)(buf+12) == 2002 ||
+									*(int32_t *)(buf+12) == 2003 ||
+									*(int32_t *)(buf+12) == 2004 ||
+									*(int32_t *)(buf+12) == 2005 ||
+									*(int32_t *)(buf+12) == 2006 ||
+									*(int32_t *)(buf+12) == 2007)
 							   )
 							) {
+						sockfd_put(sock);
+						return 2000;
+					} else if (dport == PPM_PORT_STATSD) {
 						sockfd_put(sock);
 						return 2000;
 					} else {
@@ -314,12 +419,12 @@ int val_to_ring(struct event_filler_arguments *args, uint64_t val, u16 val_len, 
 
 	if (unlikely(args->curarg >= args->nargs)) {
 		pr_err("(%u)val_to_ring: too many arguments for event #%u, type=%u, curarg=%u, nargs=%u tid:%u\n",
-		       smp_processor_id(),
-		       args->nevents,
-		       (u32)args->event_type,
-		       args->curarg,
-		       args->nargs,
-		       current->pid);
+			smp_processor_id(),
+			args->nevents,
+			(u32)args->event_type,
+			args->curarg,
+			args->nargs,
+			current->pid);
 		memory_dump(args->buffer - sizeof(struct ppm_evt_hdr), 32);
 		ASSERT(0);
 		return PPM_FAILURE_BUG;
@@ -381,8 +486,8 @@ int val_to_ring(struct event_filler_arguments *args, uint64_t val, u16 val_len, 
 			 * Handle NULL pointers
 			 */
 			len = strlcpy(args->buffer + args->arg_data_offset,
-			       "(NULL)",
-			       args->arg_data_size);
+				"(NULL)",
+				args->arg_data_size);
 
 			if (++len > args->arg_data_size)
 				len = args->arg_data_size;
@@ -521,6 +626,7 @@ int val_to_ring(struct event_filler_arguments *args, uint64_t val, u16 val_len, 
 	case PT_UINT32:
 	case PT_UID:
 	case PT_GID:
+	case PT_SIGSET:
 		if (likely(args->arg_data_size >= sizeof(u32))) {
 			*(u32 *)(args->buffer + args->arg_data_offset) = (u32)val;
 			len = sizeof(u32);
@@ -582,9 +688,9 @@ int val_to_ring(struct event_filler_arguments *args, uint64_t val, u16 val_len, 
 	default:
 		ASSERT(0);
 		pr_err("val_to_ring: invalid argument type %d. Event %u (%s) might have less parameters than what has been declared in nparams\n",
-		       (int)g_event_info[args->event_type].params[args->curarg].type,
-		       (u32)args->event_type,
-		       g_event_info[args->event_type].name);
+			(int)g_event_info[args->event_type].params[args->curarg].type,
+			(u32)args->event_type,
+			g_event_info[args->event_type].name);
 		return PPM_FAILURE_BUG;
 	}
 
@@ -605,6 +711,7 @@ int val_to_ring(struct event_filler_arguments *args, uint64_t val, u16 val_len, 
  * of buf.
  * Buf must be at least 1 page in size.
  */
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20)
 char *npm_getcwd(char *buf, unsigned long bufsize)
 {
 	struct path pwd;
@@ -630,96 +737,126 @@ char *npm_getcwd(char *buf, unsigned long bufsize)
 
 	return res;
 }
+#else /* LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 20) */
+char *npm_getcwd(char *buf, unsigned long bufsize)
+{
+	struct dentry *dentry;
+	struct vfsmount *mnt;
+	char *res;
+
+	ASSERT(bufsize >= PAGE_SIZE - 1);
+
+	read_lock(&current->fs->lock);
+	mnt = mntget(current->fs->pwdmnt);
+	dentry = dget(current->fs->pwd);
+	read_unlock(&current->fs->lock);
+
+	res = d_path(dentry, mnt, buf, bufsize);
+
+	if (IS_ERR(res))
+		res = NULL;
+
+	return res;
+}
+#endif
 
 static inline u8 socket_family_to_scap(u8 family)
 {
-	if (family == AF_INET) {
+	if (family == AF_INET)
 		return PPM_AF_INET;
-	} else if (family == AF_INET6) {
+	else if (family == AF_INET6)
 		return PPM_AF_INET6;
-	} else if (family == AF_UNIX) {
+	else if (family == AF_UNIX)
 		return PPM_AF_UNIX;
-	} else if (family == AF_NETLINK) {
+	else if (family == AF_NETLINK)
 		return PPM_AF_NETLINK;
-	} else if (family == AF_PACKET) {
+	else if (family == AF_PACKET)
 		return PPM_AF_PACKET;
-	} else if (family == AF_UNSPEC) {
+	else if (family == AF_UNSPEC)
 		return PPM_AF_UNSPEC;
-	} else if (family == AF_AX25) {
+	else if (family == AF_AX25)
 		return PPM_AF_AX25;
-	} else if (family == AF_IPX) {
+	else if (family == AF_IPX)
 		return PPM_AF_IPX;
-	} else if (family == AF_APPLETALK) {
+	else if (family == AF_APPLETALK)
 		return PPM_AF_APPLETALK;
-	} else if (family == AF_NETROM) {
+	else if (family == AF_NETROM)
 		return PPM_AF_NETROM;
-	} else if (family == AF_BRIDGE) {
+	else if (family == AF_BRIDGE)
 		return PPM_AF_BRIDGE;
-	} else if (family == AF_ATMPVC) {
+	else if (family == AF_ATMPVC)
 		return PPM_AF_ATMPVC;
-	} else if (family == AF_X25) {
+	else if (family == AF_X25)
 		return PPM_AF_X25;
-	} else if (family == AF_ROSE) {
+	else if (family == AF_ROSE)
 		return PPM_AF_ROSE;
-	} else if (family == AF_DECnet) {
+	else if (family == AF_DECnet)
 		return PPM_AF_DECnet;
-	} else if (family == AF_NETBEUI) {
+	else if (family == AF_NETBEUI)
 		return PPM_AF_NETBEUI;
-	} else if (family == AF_SECURITY) {
+	else if (family == AF_SECURITY)
 		return PPM_AF_SECURITY;
-	} else if (family == AF_KEY) {
+	else if (family == AF_KEY)
 		return PPM_AF_KEY;
-	} else if (family == AF_ROUTE) {
+	else if (family == AF_ROUTE)
 		return PPM_AF_ROUTE;
-	} else if (family == AF_ASH) {
+	else if (family == AF_ASH)
 		return PPM_AF_ASH;
-	} else if (family == AF_ECONET) {
+	else if (family == AF_ECONET)
 		return PPM_AF_ECONET;
-	} else if (family == AF_ATMSVC) {
+	else if (family == AF_ATMSVC)
 		return PPM_AF_ATMSVC;
-	} else if (family == AF_RDS) {
+#ifdef AF_RDS
+	else if (family == AF_RDS)
 		return PPM_AF_RDS;
-	} else if (family == AF_SNA) {
+#endif
+	else if (family == AF_SNA)
 		return PPM_AF_SNA;
-	} else if (family == AF_IRDA) {
+	else if (family == AF_IRDA)
 		return PPM_AF_IRDA;
-	} else if (family == AF_PPPOX) {
+	else if (family == AF_PPPOX)
 		return PPM_AF_PPPOX;
-	} else if (family == AF_WANPIPE) {
+	else if (family == AF_WANPIPE)
 		return PPM_AF_WANPIPE;
-	} else if (family == AF_LLC) {
+	else if (family == AF_LLC)
 		return PPM_AF_LLC;
-	} else if (family == AF_CAN) {
+#ifdef AF_CAN
+	else if (family == AF_CAN)
 		return PPM_AF_CAN;
-	} else if (family == AF_TIPC) {
+#endif
+	 else if (family == AF_TIPC)
 		return PPM_AF_TIPC;
-	} else if (family == AF_BLUETOOTH) {
+	else if (family == AF_BLUETOOTH)
 		return PPM_AF_BLUETOOTH;
-	} else if (family == AF_IUCV) {
+	else if (family == AF_IUCV)
 		return PPM_AF_IUCV;
-	} else if (family == AF_RXRPC) {
+#ifdef AF_RXRPC
+	else if (family == AF_RXRPC)
 		return PPM_AF_RXRPC;
-	} else if (family == AF_ISDN) {
+#endif
+#ifdef AF_ISDN
+	else if (family == AF_ISDN)
 		return PPM_AF_ISDN;
-	} else if (family == AF_PHONET) {
+#endif
+#ifdef AF_PHONET
+	else if (family == AF_PHONET)
 		return PPM_AF_PHONET;
-	} else if (family == AF_IEEE802154) {
+#endif
+#ifdef AF_IEEE802154
+	else if (family == AF_IEEE802154)
 		return PPM_AF_IEEE802154;
-	}
+#endif
 #ifdef AF_CAIF
-	else if (family == AF_CAIF) {
+	else if (family == AF_CAIF)
 		return PPM_AF_CAIF;
-	}
 #endif
 #ifdef AF_ALG
-	else if (family == AF_ALG) {
+	else if (family == AF_ALG)
 		return PPM_AF_ALG;
-	}
 #endif
 #ifdef AF_NFC
-	else if (family == AF_NFC) {
+	else if (family == AF_NFC)
 		return PPM_AF_NFC;
-	}
 #endif
 	else {
 		ASSERT(false);
@@ -1135,7 +1272,7 @@ int32_t parse_readv_writev_bufs(struct event_filler_arguments *args, const struc
 
 		/*
 		 * Size is the total size of the buffers provided by the user. The number of
-		 * received bytes can be smaller 
+		 * received bytes can be smaller
 		 */
 		if ((flags & PRB_FLAG_IS_WRITE) == 0)
 			if (size > retval)
@@ -1154,7 +1291,10 @@ int32_t parse_readv_writev_bufs(struct event_filler_arguments *args, const struc
 			/*
 			 * Retrieve the FD. It will be used for dynamic snaplen calculation.
 			 */
-			syscall_get_arguments(current, args->regs, 0, 1, &val);
+			if (!args->is_socketcall)
+				syscall_get_arguments(current, args->regs, 0, 1, &val);
+			else
+				val = args->socketcall_args[0];
 			args->fd = (int)val;
 
 			/*
@@ -1168,7 +1308,7 @@ int32_t parse_readv_writev_bufs(struct event_filler_arguments *args, const struc
 						ASSERT(bufsize >= retval);
 
 						/*
-						 * Copied all the data even if we haven't reached the 
+						 * Copied all the data even if we haven't reached the
 						 * end of the buffer.
 						 * Copy must stop here.
 						 */
@@ -1222,6 +1362,138 @@ int32_t parse_readv_writev_bufs(struct event_filler_arguments *args, const struc
 	return PPM_SUCCESS;
 }
 
+#ifdef CONFIG_COMPAT
+/*
+ * Parses the list of buffers of a xreadv or xwritev call, and pushes the size
+ * (and optionally the data) to the ring.
+ */
+int32_t compat_parse_readv_writev_bufs(struct event_filler_arguments *args, const struct compat_iovec __user *iovsrc, unsigned long iovcnt, int64_t retval, int flags)
+{
+	int32_t res;
+	const struct compat_iovec *iov;
+	u32 copylen;
+	u32 j;
+	u64 size = 0;
+	unsigned long bufsize;
+	char *targetbuf = args->str_storage;
+	u32 targetbuflen = STR_STORAGE_SIZE;
+	unsigned long val;
+	u32 notcopied_len;
+	compat_size_t tocopy_len;
+
+	copylen = iovcnt * sizeof(struct compat_iovec);
+
+	if (unlikely(copylen >= STR_STORAGE_SIZE))
+		return PPM_FAILURE_BUFFER_FULL;
+
+	if (unlikely(ppm_copy_from_user(args->str_storage, iovsrc, copylen)))
+		return PPM_FAILURE_INVALID_USER_MEMORY;
+
+	iov = (const struct compat_iovec *)(args->str_storage);
+
+	targetbuf += copylen;
+	targetbuflen -= copylen;
+
+	/*
+	 * Size
+	 */
+	if (flags & PRB_FLAG_PUSH_SIZE) {
+		for (j = 0; j < iovcnt; j++)
+			size += iov[j].iov_len;
+
+		/*
+		 * Size is the total size of the buffers provided by the user. The number of
+		 * received bytes can be smaller
+		 */
+		if ((flags & PRB_FLAG_IS_WRITE) == 0)
+			if (size > retval)
+				size = retval;
+
+		res = val_to_ring(args, size, 0, false, 0);
+		if (unlikely(res != PPM_SUCCESS))
+			return res;
+	}
+
+	/*
+	 * data
+	 */
+	if (flags & PRB_FLAG_PUSH_DATA) {
+		if (retval > 0 && iovcnt > 0) {
+			/*
+			 * Retrieve the FD. It will be used for dynamic snaplen calculation.
+			 */
+			if (!args->is_socketcall)
+				syscall_get_arguments(current, args->regs, 0, 1, &val);
+			else
+				val = args->socketcall_args[0];
+			args->fd = (int)val;
+
+			/*
+			 * Merge the buffers
+			 */
+			bufsize = 0;
+
+			for (j = 0; j < iovcnt; j++) {
+				if ((flags & PRB_FLAG_IS_WRITE) == 0) {
+					if (bufsize >= retval) {
+						ASSERT(bufsize >= retval);
+
+						/*
+						 * Copied all the data even if we haven't reached the
+						 * end of the buffer.
+						 * Copy must stop here.
+						 */
+						break;
+					}
+
+					tocopy_len = min(iov[j].iov_len, (compat_size_t)((size_t)retval - bufsize));
+					tocopy_len = min(tocopy_len, (compat_size_t)(targetbuflen - bufsize - 1));
+				} else {
+					tocopy_len = min(iov[j].iov_len, (compat_size_t)(targetbuflen - bufsize - 1));
+				}
+
+				notcopied_len = (int)ppm_copy_from_user(targetbuf + bufsize,
+									compat_ptr(iov[j].iov_base),
+						tocopy_len);
+
+				if (unlikely(notcopied_len != 0)) {
+					/*
+					 * This means we had a page fault. Skip this event.
+					 */
+					return PPM_FAILURE_INVALID_USER_MEMORY;
+				}
+
+				bufsize += tocopy_len;
+
+				if (tocopy_len != iov[j].iov_len) {
+					/*
+					 * No space left in the args->str_storage buffer.
+					 * Copy must stop here.
+					 */
+					break;
+				}
+			}
+
+			args->enforce_snaplen = true;
+
+			res = val_to_ring(args,
+				(unsigned long)targetbuf,
+				bufsize,
+				false,
+				0);
+			if (unlikely(res != PPM_SUCCESS))
+				return res;
+		} else {
+			res = val_to_ring(args, 0, 0, false, 0);
+			if (unlikely(res != PPM_SUCCESS))
+				return res;
+		}
+	}
+
+	return PPM_SUCCESS;
+}
+#endif /* CONFIG_COMPAT */
+
 /*
  * STANDARD FILLERS
  */
@@ -1244,29 +1516,21 @@ int f_sys_autofill(struct event_filler_arguments *args, const struct ppm_event_e
 
 	for (j = 0; j < evinfo->n_autofill_args; j++) {
 		if (evinfo->autofill_args[j].id >= 0) {
-#ifndef __NR_socketcall
-			/*
-			 * Regular argument
-			 */
-			syscall_get_arguments(current,
-				args->regs,
-				evinfo->autofill_args[j].id,
-				1,
-				&val);
-#else
-			if (evinfo->paramtype == APT_SOCK) {
+#ifdef _HAS_SOCKETCALL
+			if (args->is_socketcall && evinfo->paramtype == APT_SOCK) {
 				val = args->socketcall_args[evinfo->autofill_args[j].id];
-			} else {
+			} else
+#endif
+			{
 				/*
 				 * Regular argument
 				 */
 				syscall_get_arguments(current,
-					args->regs,
-					evinfo->autofill_args[j].id,
-					1,
-					&val);
+						args->regs,
+						evinfo->autofill_args[j].id,
+						1,
+						&val);
 			}
-#endif
 
 			res = val_to_ring(args, val, 0, true, 0);
 			if (unlikely(res != PPM_SUCCESS))

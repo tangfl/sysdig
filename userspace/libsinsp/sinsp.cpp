@@ -16,7 +16,6 @@ You should have received a copy of the GNU General Public License
 along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #ifndef _WIN32
@@ -25,14 +24,20 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/time.h>
 #endif // _WIN32
 
 #include "sinsp.h"
 #include "sinsp_int.h"
+#include "sinsp_auth.h"
 #include "filter.h"
 #include "filterchecks.h"
+#include "chisel.h"
 #include "cyclewriter.h"
 #include "protodecoder.h"
+
+#include "k8s_api_handler.h"
+
 #ifdef HAS_ANALYZER
 #include "analyzer_int.h"
 #include "analyzer.h"
@@ -43,8 +48,8 @@ extern sinsp_evttables g_infotables;
 extern vector<chiseldir_info>* g_chisel_dirs;
 #endif
 
-void on_new_entry_from_proc(void* context, int64_t tid, scap_threadinfo* tinfo, 
-							scap_fdinfo* fdinfo, scap_t* newhandle); 
+void on_new_entry_from_proc(void* context, int64_t tid, scap_threadinfo* tinfo,
+							scap_fdinfo* fdinfo, scap_t* newhandle);
 
 ///////////////////////////////////////////////////////////////////////////////
 // sinsp implementation
@@ -56,22 +61,26 @@ sinsp::sinsp() :
 	m_h = NULL;
 	m_parser = NULL;
 	m_dumper = NULL;
+	m_metaevt = NULL;
+	m_skipped_evt = NULL;
+	m_meinfo.m_piscapevt = NULL;
 	m_network_interfaces = NULL;
 	m_parser = new sinsp_parser(this);
 	m_thread_manager = new sinsp_thread_manager(this);
 	m_max_thread_table_size = MAX_THREAD_TABLE_SIZE;
+	m_max_fdtable_size = MAX_FD_TABLE_SIZE;
 	m_thread_timeout_ns = DEFAULT_THREAD_TIMEOUT_S * ONE_SECOND_IN_NS;
 	m_inactive_thread_scan_time_ns = DEFAULT_INACTIVE_THREAD_SCAN_TIME_S * ONE_SECOND_IN_NS;
 	m_inactive_container_scan_time_ns = DEFAULT_INACTIVE_CONTAINER_SCAN_TIME_S * ONE_SECOND_IN_NS;
 	m_cycle_writer = NULL;
 	m_write_cycling = false;
-
 #ifdef HAS_ANALYZER
 	m_analyzer = NULL;
 #endif
 
 #ifdef HAS_FILTERING
 	m_filter = NULL;
+	m_evttype_filter = NULL;
 #endif
 
 	m_fds_to_remove = new vector<int64_t>;
@@ -87,19 +96,57 @@ sinsp::sinsp() :
 	m_buffer_format = sinsp_evt::PF_NORMAL;
 	m_isdebug_enabled = false;
 	m_isfatfile_enabled = false;
+	m_hostname_and_port_resolution_enabled = true;
+	m_output_time_flag = 'h';
 	m_max_evt_output_len = 0;
 	m_filesize = -1;
+	m_track_tracers_state = false;
 	m_import_users = true;
 	m_meta_evt_buf = new char[SP_EVT_BUF_SIZE];
 	m_meta_evt.m_pevt = (scap_evt*) m_meta_evt_buf;
 	m_meta_evt_pending = false;
+	m_next_flush_time_ns = 0;
+	m_last_procrequest_tod = 0;
+	m_get_procs_cpu_from_driver = false;
+	m_is_tracers_capture_enabled = false;
 
-        // Unless the cmd line arg "-pc" or "-pcontainer" is supplied this is false
-        m_print_container_data = false;
+	// Unless the cmd line arg "-pc" or "-pcontainer" is supplied this is false
+	m_print_container_data = false;
 
 #if defined(HAS_CAPTURE)
-	m_sysdig_pid = 0;
+	m_sysdig_pid = getpid();
 #endif
+
+	uint32_t evlen = sizeof(scap_evt) + 2 * sizeof(uint16_t) + 2 * sizeof(uint64_t);
+	m_meinfo.m_piscapevt = (scap_evt*)new char[evlen];
+	m_meinfo.m_piscapevt->type = PPME_PROCINFO_E;
+	m_meinfo.m_piscapevt->len = evlen;
+	uint16_t* lens = (uint16_t*)((char *)m_meinfo.m_piscapevt + sizeof(struct ppm_evt_hdr));
+	lens[0] = 8;
+	lens[1] = 8;
+	m_meinfo.m_piscapevt_vals = (uint64_t*)(lens + 2);
+
+	m_meinfo.m_pievt.m_inspector = this;
+	m_meinfo.m_pievt.m_info = &(g_infotables.m_event_info[PPME_SYSDIGEVENT_X]);
+	m_meinfo.m_pievt.m_pevt = NULL;
+	m_meinfo.m_pievt.m_cpuid = 0;
+	m_meinfo.m_pievt.m_evtnum = 0;
+	m_meinfo.m_pievt.m_pevt = m_meinfo.m_piscapevt;
+	m_meinfo.m_pievt.m_fdinfo = NULL;
+	m_meinfo.m_n_procinfo_evts = 0;
+	m_meta_event_callback = NULL;
+	m_meta_event_callback_data = NULL;
+	m_k8s_client = NULL;
+	m_k8s_last_watch_time_ns = 0;
+
+	m_k8s_client = NULL;
+	m_k8s_api_server = NULL;
+	m_k8s_api_cert = NULL;
+
+	m_mesos_client = NULL;
+	m_mesos_last_watch_time_ns = 0;
+
+	m_filter_proc_table_when_saving = false;
 }
 
 sinsp::~sinsp()
@@ -134,11 +181,50 @@ sinsp::~sinsp()
 		delete[] m_meta_evt_buf;
 		m_meta_evt_buf = NULL;
 	}
+
+	if(m_meinfo.m_piscapevt)
+	{
+		delete[] m_meinfo.m_piscapevt;
+	}
+
+	delete m_k8s_client;
+	delete m_k8s_api_server;
+	delete m_k8s_api_cert;
+
+	delete m_mesos_client;
 }
 
 void sinsp::add_protodecoders()
 {
 	m_parser->add_protodecoder("syslog");
+}
+
+void sinsp::filter_proc_table_when_saving(bool filter)
+{
+	m_filter_proc_table_when_saving = filter;
+
+	if(m_h != NULL)
+	{
+		scap_set_refresh_proc_table_when_saving(m_h, !filter);
+	}
+}
+
+void sinsp::enable_tracers_capture()
+{
+#if defined(HAS_CAPTURE)
+	if(!m_is_tracers_capture_enabled)
+	{
+		if(is_live() && m_h != NULL)
+		{
+			if(scap_enable_tracers_capture(m_h) != SCAP_SUCCESS)
+			{
+				throw sinsp_exception("error enabling tracers capture");
+			}
+		}
+
+		m_is_tracers_capture_enabled = true;
+	}
+#endif
 }
 
 void sinsp::init()
@@ -160,12 +246,19 @@ void sinsp::init()
 	//
 	// Attach the protocol decoders
 	//
+#ifndef HAS_ANALYZER
 	add_protodecoders();
-
+#endif
 	//
 	// Allocate the cycle writer
 	//
-	m_cycle_writer = new cycle_writer();
+	if(m_cycle_writer)
+	{
+		delete m_cycle_writer;
+		m_cycle_writer = NULL;
+	}
+
+	m_cycle_writer = new cycle_writer(this->is_live());
 
 	//
 	// Basic inits
@@ -174,6 +267,7 @@ void sinsp::init()
 	m_stats.clear();
 #endif
 
+	m_nevts = 0;
 	m_tid_to_remove = -1;
 	m_lastevent_ts = 0;
 #ifdef HAS_FILTERING
@@ -183,7 +277,64 @@ void sinsp::init()
 	m_n_proc_lookups = 0;
 	m_n_proc_lookups_duration_ns = 0;
 
+	//
+	// Return the tracers to the pool and clear the tracers list
+	//
+	for(auto it = m_partial_tracers_list.begin(); it != m_partial_tracers_list.end(); ++it)
+	{
+		m_partial_tracers_pool->push(*it);
+	}
+	m_partial_tracers_list.clear();
+
+	//
+	// If we're reading from file, we try to pre-parse the container events before
+	// importing the thread table, so that thread table filtering will work with
+	// container filters
+	//
 	if(m_islive == false)
+	{
+		uint64_t off = scap_ftell(m_h);
+		scap_evt* pevent;
+		uint16_t pcpuid;
+		uint32_t ncnt = 0;
+
+		//
+		// Count how many container events we have
+		//
+		while(true)
+		{
+			int32_t res = scap_next(m_h, &pevent, &pcpuid);
+
+			if(res == SCAP_SUCCESS)
+			{
+				if((pevent->type != PPME_CONTAINER_E) && (pevent->type != PPME_CONTAINER_JSON_E))
+				{
+					break;
+				}
+				else
+				{
+					ncnt++;
+					continue;
+				}
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		//
+		// Rewind and consume the exact number of events
+		//
+		scap_fseek(m_h, off);
+		for(uint32_t j = 0; j < ncnt; j++)
+		{
+			sinsp_evt* tevt;
+			next(&tevt);
+		}
+	}
+
+	if(m_islive == false || m_filter_proc_table_when_saving == true)
 	{
 		import_thread_table();
 	}
@@ -254,8 +405,13 @@ void sinsp::open(uint32_t timeout_ms)
 	//
 	scap_open_args oargs;
 	oargs.fname = NULL;
-	oargs.proc_callback = ::on_new_entry_from_proc;
-	oargs.proc_callback_context = this;
+	oargs.proc_callback = NULL;
+	oargs.proc_callback_context = NULL;
+	if(!m_filter_proc_table_when_saving)
+	{
+		oargs.proc_callback = ::on_new_entry_from_proc;
+		oargs.proc_callback_context = this;
+	}
 	oargs.import_users = m_import_users;
 
 	m_h = scap_open(oargs, error);
@@ -265,12 +421,68 @@ void sinsp::open(uint32_t timeout_ms)
 		throw sinsp_exception(error);
 	}
 
+	scap_set_refresh_proc_table_when_saving(m_h, !m_filter_proc_table_when_saving);
+
 	init();
+}
+
+int64_t sinsp::get_file_size(const std::string& fname, char *error)
+{
+	static string err_str = "Could not determine capture file size: ";
+	std::string errdesc;
+#ifdef _WIN32
+	LARGE_INTEGER li = { 0 };
+	HANDLE fh = CreateFile(fname.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+		OPEN_EXISTING, FILE_ATTRIBUTE_READONLY, NULL);
+	if (fh != INVALID_HANDLE_VALUE)
+	{
+		if (0 != GetFileSizeEx(fh, &li))
+		{
+			CloseHandle(fh);
+			return li.QuadPart;
+		}
+		errdesc = get_error_desc(err_str);
+		CloseHandle(fh);
+	}
+#else
+	struct stat st;
+	if (0 == stat(fname.c_str(), &st))
+	{
+		return st.st_size;
+	}
+#endif
+	if(errdesc.empty()) errdesc = get_error_desc(err_str);
+	strncpy(error, errdesc.c_str(), errdesc.size() > SCAP_LASTERR_SIZE ? SCAP_LASTERR_SIZE : errdesc.size());
+	return -1;
+}
+
+std::string sinsp::get_error_desc(const std::string& msg)
+{
+#ifdef _WIN32
+	DWORD err_no = GetLastError(); // first, so error is not wiped out by intermediate calls
+	std::string errstr = msg;
+	DWORD flg = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+	LPTSTR msg_buf = 0;
+	if(FormatMessageA(flg, 0, err_no, 0, (LPTSTR)&msg_buf, 0, NULL))
+	if(msg_buf)
+	{
+		errstr.append(msg_buf, strlen(msg_buf));
+		LocalFree(msg_buf);
+	}
+#else
+	char* msg_buf = strerror(errno); // first, so error is not wiped out by intermediate calls
+	std::string errstr = msg;
+	if(msg_buf)
+	{
+		errstr.append(msg_buf, strlen(msg_buf));
+	}
+#endif
+	return errstr;
 }
 
 void sinsp::open(string filename)
 {
-	char error[SCAP_LASTERR_SIZE];
+	char error[SCAP_LASTERR_SIZE] = {0};
 
 	m_islive = false;
 
@@ -305,18 +517,11 @@ void sinsp::open(string filename)
 		throw sinsp_exception(error);
 	}
 
-	//
-	// gianluca: This might need to be replaced with
-	// a portable stat(), since I'm afraid that on S3
-	// (that we'll use in the backend) the seek will
-	// read the entire file anyway
-	//
-	FILE* fp = fopen(filename.c_str(), "rb");
-	if(fp)
+	m_filesize = get_file_size(filename, error);
+
+	if(m_filesize < 0)
 	{
-		fseek(fp, 0L, SEEK_END);
-		m_filesize = ftell(fp);
-		fclose(fp);
+		throw sinsp_exception(error);
 	}
 
 	init();
@@ -347,6 +552,12 @@ void sinsp::close()
 	{
 		delete m_filter;
 		m_filter = NULL;
+	}
+
+	if(m_evttype_filter != NULL)
+	{
+		delete m_evttype_filter;
+		m_evttype_filter = NULL;
 	}
 #endif
 }
@@ -395,9 +606,9 @@ void sinsp::autodump_stop()
 	}
 }
 
-void sinsp::on_new_entry_from_proc(void* context, 
-								   int64_t tid, 
-								   scap_threadinfo* tinfo, 
+void sinsp::on_new_entry_from_proc(void* context,
+								   int64_t tid,
+								   scap_threadinfo* tinfo,
 								   scap_fdinfo* fdinfo,
 								   scap_t* newhandle)
 {
@@ -449,13 +660,14 @@ void sinsp::on_new_entry_from_proc(void* context,
 			}
 		}
 
-		sinsp_tinfo->add_fd(fdinfo);
+		sinsp_fdinfo_t sinsp_fdinfo;
+		sinsp_tinfo->add_fd_from_scap(fdinfo, &sinsp_fdinfo);
 	}
 }
 
-void on_new_entry_from_proc(void* context, 
-							int64_t tid, 
-							scap_threadinfo* tinfo, 
+void on_new_entry_from_proc(void* context,
+							int64_t tid,
+							scap_threadinfo* tinfo,
 							scap_fdinfo* fdinfo,
 							scap_t* newhandle)
 {
@@ -483,7 +695,7 @@ void sinsp::import_thread_table()
 
 void sinsp::import_ifaddr_list()
 {
-	m_network_interfaces = new sinsp_network_interfaces;
+	m_network_interfaces = new sinsp_network_interfaces(this);
 	m_network_interfaces->import_interfaces(scap_get_ifaddr_list(m_h));
 }
 
@@ -517,73 +729,220 @@ void sinsp::import_ipv4_interface(const sinsp_ipv4_ifinfo& ifinfo)
 	m_network_interfaces->import_ipv4_interface(ifinfo);
 }
 
+void sinsp::refresh_ifaddr_list()
+{
+#ifdef HAS_CAPTURE
+	if(m_islive)
+	{
+		ASSERT(m_network_interfaces);
+		scap_refresh_iflist(m_h);
+		m_network_interfaces->clear();
+		m_network_interfaces->import_interfaces(scap_get_ifaddr_list(m_h));
+	}
+#endif
+}
+
 bool should_drop(sinsp_evt *evt, bool* stopped, bool* switched);
 
-int32_t sinsp::next(OUT sinsp_evt **evt)
+void sinsp::add_meta_event(sinsp_evt *metaevt)
 {
-	//
-	// Reset previous event's decoders if required
-	//
-	if(m_decoders_reset_list.size() != 0)
+	m_metaevt = metaevt;
+}
+
+void sinsp::add_meta_event_and_repeat(sinsp_evt *metaevt)
+{
+	m_metaevt = metaevt;
+	m_skipped_evt = &m_evt;
+}
+
+void sinsp::add_meta_event_callback(meta_event_callback cback, void* data)
+{
+	m_meta_event_callback = cback;
+	m_meta_event_callback_data = data;
+}
+
+void sinsp::remove_meta_event_callback()
+{
+	m_meta_event_callback = NULL;
+}
+
+void schedule_next_threadinfo_evt(sinsp* _this, void* data)
+{
+	sinsp_proc_metainfo* mei = (sinsp_proc_metainfo*)data;
+	ASSERT(mei->m_pli != NULL);
+
+	while(true)
 	{
-		vector<sinsp_protodecoder*>::iterator it;
-		for(it = m_decoders_reset_list.begin(); it != m_decoders_reset_list.end(); ++it)
+		ASSERT(mei->m_cur_procinfo_evt <= (int32_t)mei->m_n_procinfo_evts);
+		ppm_proc_info* pi = &(mei->m_pli->entries[mei->m_cur_procinfo_evt]);
+
+		if(mei->m_cur_procinfo_evt >= 0)
 		{
-			(*it)->on_reset(&m_evt);
+			mei->m_piscapevt->tid = pi->pid;
+			mei->m_piscapevt_vals[0] = pi->utime;
+			mei->m_piscapevt_vals[1] = pi->stime;
 		}
 
-		m_decoders_reset_list.clear();
+		mei->m_cur_procinfo_evt++;
+
+		if(mei->m_cur_procinfo_evt < (int32_t)mei->m_n_procinfo_evts)
+		{
+			if(pi->utime == 0 && pi->stime == 0)
+			{
+				continue;
+			}
+
+			_this->add_meta_event(&mei->m_pievt);
+		}
+		else if(mei->m_cur_procinfo_evt == (int32_t)mei->m_n_procinfo_evts)
+		{
+			_this->add_meta_event(mei->m_next_evt);
+		}
+
+		break;
 	}
+}
+
+int32_t sinsp::next(OUT sinsp_evt **puevt)
+{
+	sinsp_evt* evt;
+	int32_t res;
 
 	//
-	// Get the event from libscap
+	// Check if there are fake cpu events to  events
 	//
-	int32_t res = scap_next(m_h, &(m_evt.m_pevt), &(m_evt.m_cpuid));
-
-	// The number of bytes to consider in the dumper
-	int32_t bytes_to_write;
-
-	if(res != SCAP_SUCCESS)
+	if(m_metaevt != NULL)
 	{
-		if(res == SCAP_TIMEOUT)
+		res = SCAP_SUCCESS;
+		evt = m_metaevt;
+
+		if(m_skipped_evt)
 		{
-#ifdef HAS_ANALYZER
-			if(m_analyzer)
-			{
-				m_analyzer->process_event(NULL, sinsp_analyzer::DF_TIMEOUT);
-			}
-#endif
-			*evt = NULL;
-			return res;
-		}
-		else if(res == SCAP_EOF)
-		{
-#ifdef HAS_ANALYZER
-			if(m_analyzer)
-			{
-				m_analyzer->process_event(NULL, sinsp_analyzer::DF_EOF);
-			}
-#endif
+			m_metaevt = m_skipped_evt;
+			m_skipped_evt = NULL;
 		}
 		else
 		{
-			throw sinsp_exception(scap_getlasterr(m_h));
+			m_metaevt = NULL;
 		}
 
-		return res;
+		if(m_meta_event_callback != NULL)
+		{
+			m_meta_event_callback(this, m_meta_event_callback_data);
+		}
+	}
+	else
+	{
+		evt = &m_evt;
+
+		//
+		// Reset previous event's decoders if required
+		//
+		if(m_decoders_reset_list.size() != 0)
+		{
+			vector<sinsp_protodecoder*>::iterator it;
+			for(it = m_decoders_reset_list.begin(); it != m_decoders_reset_list.end(); ++it)
+			{
+				(*it)->on_reset(evt);
+			}
+
+			m_decoders_reset_list.clear();
+		}
+
+		//
+		// Get the event from libscap
+		//
+		res = scap_next(m_h, &(evt->m_pevt), &(evt->m_cpuid));
+
+		if(res != SCAP_SUCCESS)
+		{
+			if(res == SCAP_TIMEOUT)
+			{
+	#ifdef HAS_ANALYZER
+				if(m_analyzer)
+				{
+					m_analyzer->process_event(NULL, sinsp_analyzer::DF_TIMEOUT);
+				}
+	#endif
+				*puevt = NULL;
+				return res;
+			}
+			else if(res == SCAP_EOF)
+			{
+	#ifdef HAS_ANALYZER
+				if(m_analyzer)
+				{
+					m_analyzer->process_event(NULL, sinsp_analyzer::DF_EOF);
+				}
+	#endif
+			}
+			else
+			{
+				m_lasterr = scap_getlasterr(m_h);
+			}
+
+			return res;
+		}
+	}
+
+	uint64_t ts = evt->get_ts();
+
+	if(m_firstevent_ts == 0)
+	{
+		m_firstevent_ts = ts;
+	}
+
+	//
+	// If required, retrieve the processes cpu from the kernel
+	//
+	if(m_get_procs_cpu_from_driver && m_islive)
+	{
+		if(ts > m_next_flush_time_ns)
+		{
+			if(m_next_flush_time_ns != 0)
+			{
+				struct timeval tod;
+				gettimeofday(&tod, NULL);
+
+				uint64_t procrequest_tod = (uint64_t)tod.tv_sec * 1000000000 + tod.tv_usec * 1000;
+
+				if(procrequest_tod - m_last_procrequest_tod > ONE_SECOND_IN_NS / 2)
+				{
+					m_last_procrequest_tod = procrequest_tod;
+					m_next_flush_time_ns = ts - (ts % ONE_SECOND_IN_NS) + ONE_SECOND_IN_NS;
+
+					m_meinfo.m_pli = scap_get_threadlist_from_driver(m_h);
+					if(m_meinfo.m_pli == NULL)
+					{
+						throw sinsp_exception(string("scap error: ") + scap_getlasterr(m_h));
+					}
+
+					m_meinfo.m_n_procinfo_evts = m_meinfo.m_pli->n_entries;
+
+					if(m_meinfo.m_n_procinfo_evts > 0)
+					{
+						m_meinfo.m_cur_procinfo_evt = -1;
+
+						m_meinfo.m_piscapevt->ts = m_next_flush_time_ns - (ONE_SECOND_IN_NS + 1);
+						m_meinfo.m_next_evt = &m_evt;
+						add_meta_event_callback(&schedule_next_threadinfo_evt, &m_meinfo);
+						schedule_next_threadinfo_evt(this, &m_meinfo);
+					}
+
+					return SCAP_TIMEOUT;
+				}
+			}
+
+			m_next_flush_time_ns = ts - (ts % ONE_SECOND_IN_NS) + ONE_SECOND_IN_NS;
+		}
 	}
 
 	//
 	// Store a couple of values that we'll need later inside the event.
 	//
-	m_evt.m_evtnum = scap_event_get_num(m_h);
-	m_lastevent_ts = m_evt.get_ts();
-#ifdef HAS_FILTERING
-	if(m_firstevent_ts == 0)
-	{
-		m_firstevent_ts = m_lastevent_ts;
-	}
-#endif
+	m_nevts++;
+	evt->m_evtnum = m_nevts;
+	m_lastevent_ts = ts;
 
 #ifndef HAS_ANALYZER
 	//
@@ -606,6 +965,13 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 	{
 		m_thread_manager->remove_inactive_threads();
 		m_container_manager.remove_inactive_containers();
+
+		update_k8s_state();
+
+		if(m_mesos_client)
+		{
+			update_mesos_state();
+		}
 	}
 #endif // HAS_ANALYZER
 
@@ -641,7 +1007,7 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 		m_analyzer->m_configuration->set_analyzer_sample_len_ns(500000000);
 	}
 
-	sd = should_drop(&m_evt, &m_isdropping, &sw);
+	sd = should_drop(evt, &m_isdropping, &sw);
 #endif
 
 	//
@@ -650,7 +1016,7 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 #ifdef SIMULATE_DROP_MODE
 	if(!sd || m_isdropping)
 	{
-		m_parser->process_event(&m_evt);
+		m_parser->process_event(evt);
 	}
 
 	if(sd && !m_isdropping)
@@ -659,7 +1025,7 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 		return SCAP_TIMEOUT;
 	}
 #else
-	m_parser->process_event(&m_evt);
+	m_parser->process_event(evt);
 #endif
 
 	//
@@ -679,44 +1045,40 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 
 #if defined(HAS_FILTERING) && defined(HAS_CAPTURE_FILTERING)
 		scap_dump_flags dflags;
-		
+
 		bool do_drop;
-		dflags = m_evt.get_dump_flags(&do_drop);
+		dflags = evt->get_dump_flags(&do_drop);
 		if(do_drop)
 		{
-			*evt = &m_evt;
+			*puevt = evt;
 			return SCAP_TIMEOUT;
 		}
 #endif
 
 		if(m_write_cycling)
 		{
-			res = scap_number_of_bytes_to_write(m_evt.m_pevt, m_evt.m_cpuid, &bytes_to_write);
-			if(SCAP_SUCCESS != res)
+			//res = scap_number_of_bytes_to_write(evt->m_pevt, evt->m_cpuid, &bytes_to_write);
+			switch(m_cycle_writer->consider(evt))
 			{
-				throw sinsp_exception(scap_getlasterr(m_h));
-			}
-			else 
-			{
-				switch(m_cycle_writer->consider(bytes_to_write))
-				{
-					case cycle_writer::NEWFILE:
-						autodump_next_file();
-						break;
+				case cycle_writer::NEWFILE:
+					autodump_next_file();
+					break;
 
-					case cycle_writer::DOQUIT:
-						stop_capture();
-						return SCAP_EOF;
-						break;
+				case cycle_writer::DOQUIT:
+					stop_capture();
+					return SCAP_EOF;
+					break;
 
-					case cycle_writer::SAMEFILE:
-						// do nothing.
-						break;
-				}
+				case cycle_writer::SAMEFILE:
+					// do nothing.
+					break;
 			}
 		}
 
-		res = scap_dump(m_h, m_dumper, m_evt.m_pevt, m_evt.m_cpuid, dflags);
+		scap_evt* pdevt = (evt->m_poriginal_evt)? evt->m_poriginal_evt : evt->m_pevt;
+
+		res = scap_dump(m_h, m_dumper, pdevt, evt->m_cpuid, dflags);
+
 		if(SCAP_SUCCESS != res)
 		{
 			throw sinsp_exception(scap_getlasterr(m_h));
@@ -724,9 +1086,9 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 	}
 
 #if defined(HAS_FILTERING) && defined(HAS_CAPTURE_FILTERING)
-	if(m_evt.m_filtered_out)
+	if(evt->m_filtered_out)
 	{
-		*evt = &m_evt;
+		*puevt = evt;
 		return SCAP_TIMEOUT;
 	}
 #endif
@@ -742,87 +1104,48 @@ int32_t sinsp::next(OUT sinsp_evt **evt)
 		{
 			if(m_isdropping)
 			{
-				m_analyzer->process_event(&m_evt, sinsp_analyzer::DF_FORCE_FLUSH);
+				m_analyzer->process_event(evt, sinsp_analyzer::DF_FORCE_FLUSH);
 			}
 			else if(sw)
 			{
-				m_analyzer->process_event(&m_evt, sinsp_analyzer::DF_FORCE_FLUSH_BUT_DONT_EMIT);
+				m_analyzer->process_event(evt, sinsp_analyzer::DF_FORCE_FLUSH_BUT_DONT_EMIT);
 			}
 			else
 			{
-				m_analyzer->process_event(&m_evt, sinsp_analyzer::DF_FORCE_NOFLUSH);
+				m_analyzer->process_event(evt, sinsp_analyzer::DF_FORCE_NOFLUSH);
 			}
 		}
 #else // SIMULATE_DROP_MODE
-		m_analyzer->process_event(&m_evt, sinsp_analyzer::DF_NONE);
+		m_analyzer->process_event(evt, sinsp_analyzer::DF_NONE);
 #endif // SIMULATE_DROP_MODE
 	}
 #endif
 
+	// Clean parse related event data after analyzer did its parsing too
+	m_parser->event_cleanup(evt);
+
 	//
 	// Update the last event time for this thread
 	//
-	if(m_evt.m_tinfo && 
-		m_evt.get_type() != PPME_SCHEDSWITCH_1_E &&
-		m_evt.get_type() != PPME_SCHEDSWITCH_6_E)
+	if(evt->m_tinfo &&
+		evt->get_type() != PPME_SCHEDSWITCH_1_E &&
+		evt->get_type() != PPME_SCHEDSWITCH_6_E)
 	{
-		m_evt.m_tinfo->m_prevevent_ts = m_evt.m_tinfo->m_lastevent_ts;
-		m_evt.m_tinfo->m_lastevent_ts = m_lastevent_ts;
+		evt->m_tinfo->m_prevevent_ts = evt->m_tinfo->m_lastevent_ts;
+		evt->m_tinfo->m_lastevent_ts = m_lastevent_ts;
 	}
 
 	//
 	// Done
 	//
-	*evt = &m_evt;
+	*puevt = evt;
 	return res;
 }
 
 uint64_t sinsp::get_num_events()
 {
+	ASSERT(m_h);
 	return scap_event_get_num(m_h);
-}
-
-sinsp_threadinfo* sinsp::find_thread(int64_t tid, bool lookup_only)
-{
-	threadinfo_map_iterator_t it;
-
-	//
-	// Try looking up in our simple cache
-	//
-	if(m_thread_manager->m_last_tinfo && tid == m_thread_manager->m_last_tid)
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_thread_manager->m_cached_lookups->increment();
-#endif
-		m_thread_manager->m_last_tinfo->m_lastaccess_ts = m_lastevent_ts;
-		return m_thread_manager->m_last_tinfo;
-	}
-
-	//
-	// Caching failed, do a real lookup
-	//
-	it = m_thread_manager->m_threadtable.find(tid);
-	
-	if(it != m_thread_manager->m_threadtable.end())
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_thread_manager->m_non_cached_lookups->increment();
-#endif
-		if(!lookup_only)
-		{
-			m_thread_manager->m_last_tid = tid;
-			m_thread_manager->m_last_tinfo = &(it->second);
-			m_thread_manager->m_last_tinfo->m_lastaccess_ts = m_lastevent_ts;
-		}
-		return &(it->second);
-	}
-	else
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_thread_manager->m_failed_lookups->increment();
-#endif
-		return NULL;
-	}
 }
 
 sinsp_threadinfo* sinsp::find_thread_test(int64_t tid, bool lookup_only)
@@ -834,46 +1157,48 @@ sinsp_threadinfo* sinsp::get_thread(int64_t tid, bool query_os_if_not_found, boo
 {
 	sinsp_threadinfo* sinsp_proc = find_thread(tid, lookup_only);
 
-	if(sinsp_proc == NULL && query_os_if_not_found)
+	if(sinsp_proc == NULL && query_os_if_not_found &&
+	   (m_thread_manager->m_threadtable.size() < m_max_thread_table_size
+#if defined(HAS_CAPTURE)
+		   || tid == m_sysdig_pid
+#endif
+		))
 	{
 		scap_threadinfo* scap_proc = NULL;
 		sinsp_threadinfo newti(this);
 
-		if(m_thread_manager->m_threadtable.size() < m_max_thread_table_size)
+		m_n_proc_lookups++;
+
+		if(m_n_proc_lookups == m_max_n_proc_socket_lookups)
 		{
-			m_n_proc_lookups++;
+			g_logger.format(sinsp_logger::SEV_INFO, "Reached max socket lookup number, tid=%" PRIu64 ", duration=%" PRIu64,
+				tid, m_n_proc_lookups_duration_ns / 1000000);
+		}
 
-			if(m_n_proc_lookups == m_max_n_proc_socket_lookups)
+		if(m_n_proc_lookups == m_max_n_proc_lookups)
+		{
+			g_logger.format(sinsp_logger::SEV_INFO, "Reached max process lookup number, duration=%" PRIu64,
+				m_n_proc_lookups_duration_ns / 1000000);
+		}
+
+		if(m_max_n_proc_lookups == 0 || (m_max_n_proc_lookups != 0 &&
+			(m_n_proc_lookups <= m_max_n_proc_lookups)))
+		{
+			bool scan_sockets = false;
+
+			if(m_max_n_proc_socket_lookups == 0 || (m_max_n_proc_socket_lookups != 0 &&
+				(m_n_proc_lookups <= m_max_n_proc_socket_lookups)))
 			{
-				g_logger.format(sinsp_logger::SEV_INFO, "Reached max socket lookup number, tid=%" PRIu64 ", duration=%" PRIu64, 
-					tid, m_n_proc_lookups_duration_ns / 1000000);
+				scan_sockets = true;
 			}
-
-			if(m_n_proc_lookups == m_max_n_proc_lookups)
-			{
-				g_logger.format(sinsp_logger::SEV_INFO, "Reached max process lookup number, duration=%" PRIu64, 
-					m_n_proc_lookups_duration_ns / 1000000);
-			}
-
-			if(m_max_n_proc_lookups == 0 || (m_max_n_proc_lookups != 0 &&
-				(m_n_proc_lookups <= m_max_n_proc_lookups)))
-			{
-				bool scan_sockets = false;
-
-				if(m_max_n_proc_socket_lookups == 0 || (m_max_n_proc_socket_lookups != 0 &&
-					(m_n_proc_lookups <= m_max_n_proc_socket_lookups)))
-				{
-					scan_sockets = true;
-				}
 
 #ifdef HAS_ANALYZER
-				uint64_t ts = sinsp_utils::get_current_time_ns();
+			uint64_t ts = sinsp_utils::get_current_time_ns();
 #endif
-				scap_proc = scap_proc_get(m_h, tid, scan_sockets);
+			scap_proc = scap_proc_get(m_h, tid, scan_sockets);
 #ifdef HAS_ANALYZER
-				m_n_proc_lookups_duration_ns += sinsp_utils::get_current_time_ns() - ts;
+			m_n_proc_lookups_duration_ns += sinsp_utils::get_current_time_ns() - ts;
 #endif
-			}
 		}
 
 		if(scap_proc)
@@ -898,7 +1223,7 @@ sinsp_threadinfo* sinsp::get_thread(int64_t tid, bool query_os_if_not_found, boo
 
 		//
 		// Since this thread is created out of thin air, we need to
-		// properly set its reference count, by scanning the table 
+		// properly set its reference count, by scanning the table
 		//
 		threadinfo_map_t* pttable = &m_thread_manager->m_threadtable;
 		threadinfo_map_iterator_t it;
@@ -981,7 +1306,7 @@ void sinsp::stop_dropping_mode()
 {
 	if(m_islive)
 	{
-		g_logger.format(sinsp_logger::SEV_ERROR, "stopping drop mode");
+		g_logger.format(sinsp_logger::SEV_INFO, "stopping drop mode");
 
 		if(scap_stop_dropping_mode(m_h) != SCAP_SUCCESS)
 		{
@@ -994,7 +1319,7 @@ void sinsp::start_dropping_mode(uint32_t sampling_ratio)
 {
 	if(m_islive)
 	{
-		g_logger.format(sinsp_logger::SEV_ERROR, "setting drop mode to %" PRIu32, sampling_ratio);
+		g_logger.format(sinsp_logger::SEV_INFO, "setting drop mode to %" PRIu32, sampling_ratio);
 
 		if(scap_start_dropping_mode(m_h, sampling_ratio) != SCAP_SUCCESS)
 		{
@@ -1004,6 +1329,17 @@ void sinsp::start_dropping_mode(uint32_t sampling_ratio)
 }
 
 #ifdef HAS_FILTERING
+void sinsp::set_filter(sinsp_filter* filter)
+{
+	if(m_filter != NULL)
+	{
+		ASSERT(false);
+		throw sinsp_exception("filter can only be set once");
+	}
+
+	m_filter = filter;
+}
+
 void sinsp::set_filter(const string& filter)
 {
 	if(m_filter != NULL)
@@ -1012,7 +1348,8 @@ void sinsp::set_filter(const string& filter)
 		throw sinsp_exception("filter can only be set once");
 	}
 
-	m_filter = new sinsp_filter(this, filter);
+	sinsp_filter_compiler compiler(this, filter);
+	m_filter = compiler.compile();
 	m_filterstring = filter;
 }
 
@@ -1021,6 +1358,38 @@ const string sinsp::get_filter()
 	return m_filterstring;
 }
 
+void sinsp::add_evttype_filter(string &name,
+			       list<uint32_t> &evttypes,
+			       sinsp_filter *filter)
+{
+	// Create the evttype filter if it doesn't exist.
+	if(m_evttype_filter == NULL)
+	{
+		m_evttype_filter = new sinsp_evttype_filter();
+	}
+
+	m_evttype_filter->add(name, evttypes, filter);
+}
+
+bool sinsp::run_filters_on_evt(sinsp_evt *evt)
+{
+	//
+	// First run the global filter, if there is one.
+	//
+	if(m_filter && m_filter->run(evt) == true)
+	{
+		return true;
+	}
+
+	//
+	// Then run the evttype filter, if there is one.
+	if(m_evttype_filter && m_evttype_filter->run(evt) == true)
+	{
+		return true;
+	}
+
+	return false;
+}
 #endif
 
 const scap_machine_info* sinsp::get_machine_info()
@@ -1109,7 +1478,24 @@ sinsp_stats sinsp::get_stats()
 
 void sinsp::set_log_callback(sinsp_logger_callback cb)
 {
-	g_logger.add_callback_log(cb);
+	if(cb)
+	{
+		g_logger.add_callback_log(cb);
+	}
+	else
+	{
+		g_logger.remove_callback_log();
+	}
+}
+
+void sinsp::set_log_file(string filename)
+{
+	g_logger.add_file_log(filename);
+}
+
+void sinsp::set_log_stderr()
+{
+	g_logger.add_stderr_log();
 }
 
 void sinsp::set_min_log_severity(sinsp_logger::severity sev)
@@ -1153,14 +1539,14 @@ void sinsp::set_buffer_format(sinsp_evt::param_fmt format)
 	m_buffer_format = format;
 }
 
+void sinsp::set_drop_event_flags(ppm_event_flags flags)
+{
+	m_parser->m_drop_event_flags = flags;
+}
+
 sinsp_evt::param_fmt sinsp::get_buffer_format()
 {
 	return m_buffer_format;
-}
-
-bool sinsp::is_live()
-{
-	return m_islive;
 }
 
 void sinsp::set_debug_mode(bool enable_debug)
@@ -1176,6 +1562,11 @@ void sinsp::set_print_container_data(bool print_container_data)
 void sinsp::set_fatfile_dump_mode(bool enable_fatfile)
 {
 	m_isfatfile_enabled = enable_fatfile;
+}
+
+void sinsp::set_hostname_and_port_resolution_mode(bool enable)
+{
+	m_hostname_and_port_resolution_enabled = enable;
 }
 
 void sinsp::set_max_evt_output_len(uint32_t len)
@@ -1198,16 +1589,16 @@ sinsp_parser* sinsp::get_parser()
 	return m_parser;
 }
 
-bool sinsp::setup_cycle_writer(string base_file_name, int rollover_mb, int duration_seconds, int file_limit, bool do_cycle, bool compress) 
+bool sinsp::setup_cycle_writer(string base_file_name, int rollover_mb, int duration_seconds, int file_limit, unsigned long event_limit, bool compress)
 {
 	m_compress = compress;
 
-	if(rollover_mb != 0 || duration_seconds != 0 || file_limit != 0 || do_cycle == true)
+	if(rollover_mb != 0 || duration_seconds != 0 || file_limit != 0 || event_limit != 0)
 	{
 		m_write_cycling = true;
 	}
 
-	return m_cycle_writer->setup(base_file_name, rollover_mb, duration_seconds, file_limit, do_cycle);
+	return m_cycle_writer->setup(base_file_name, rollover_mb, duration_seconds, file_limit, event_limit, &m_dumper);
 }
 
 double sinsp::get_read_progress()
@@ -1223,7 +1614,7 @@ double sinsp::get_read_progress()
 
 	if(fpos == -1)
 	{
-		throw sinsp_exception(scap_getlasterr(m_h));		
+		throw sinsp_exception(scap_getlasterr(m_h));
 	}
 
 	return (double)fpos * 100 / m_filesize;
@@ -1232,6 +1623,377 @@ double sinsp::get_read_progress()
 bool sinsp::remove_inactive_threads()
 {
 	return m_thread_manager->remove_inactive_threads();
+}
+
+void sinsp::init_mesos_client(string* api_server, bool verbose)
+{
+	m_verbose_json = verbose;
+	if(m_mesos_client == NULL)
+	{
+		if(api_server)
+		{
+			// -m <url[,marathon_url]>
+			std::string::size_type pos = api_server->find(',');
+			if(pos != std::string::npos)
+			{
+				m_marathon_api_server.clear();
+				m_marathon_api_server.push_back(api_server->substr(pos + 1));
+			}
+			m_mesos_api_server = api_server->substr(0, pos);
+		}
+
+		bool is_live = !m_mesos_api_server.empty();
+		m_mesos_client = new mesos(m_mesos_api_server,
+									m_marathon_api_server,
+									true, // mesos leader auto-follow
+									m_marathon_api_server.empty(), // marathon leader auto-follow if no uri
+									mesos::credentials_t(), // mesos creds, the only way to provide creds in sysdig is embedded in URI
+									mesos::credentials_t(), // marathon creds
+									mesos::default_timeout_ms,
+									is_live,
+									m_verbose_json);
+	}
+}
+
+void sinsp::init_k8s_ssl(string* api_server, string* ssl_cert)
+{
+#ifdef HAS_CAPTURE
+	if(ssl_cert && (!m_k8s_ssl || ! m_k8s_bt))
+	{
+		std::string cert;
+		std::string key;
+		std::string key_pwd;
+		std::string ca_cert;
+
+		// -K <bt_file> | <cert_file>:<key_file[#password]>[:<ca_cert_file>]
+		std::string::size_type pos = ssl_cert->find(':');
+		if(pos == std::string::npos) // ca_cert-only is obsoleted, single entry is now bearer token
+		{
+			m_k8s_bt = std::make_shared<sinsp_bearer_token>(*ssl_cert);
+			ssl_cert->clear();
+		}
+		else
+		{
+			while(ssl_cert->length())
+			{
+				if(cert.empty() && pos != std::string::npos)
+				{
+					cert = ssl_cert->substr(0, pos);
+					if(ssl_cert->length() > (pos + 1))
+					{
+						*ssl_cert = ssl_cert->substr(pos + 1);
+					}
+					else { break; }
+				}
+				else if(key.empty())
+				{
+					key = ssl_cert->substr(0, pos);
+					if(ssl_cert->length() > (pos + 1))
+					{
+						*ssl_cert = ssl_cert->substr(pos + 1);
+						std::string::size_type s_pos = key.find('#');
+						if(s_pos != std::string::npos && key.length() > (s_pos + 1))
+						{
+							key_pwd = key.substr(s_pos + 1);
+							key = key.substr(0, s_pos);
+						}
+						if(pos == std::string::npos) { break; }
+					}
+					else { break; }
+				}
+				else if(ca_cert.empty())
+				{
+					ca_cert = *ssl_cert;
+					ssl_cert->clear();
+				}
+				else { goto ssl_err; }
+				pos = ssl_cert->find(':', pos);
+			}
+			if(cert.empty() || key.empty()) { goto ssl_err; }
+		}
+		m_k8s_ssl = std::make_shared<sinsp_ssl>(cert, key, key_pwd,
+					ca_cert, ca_cert.empty() ? false : true, "PEM");
+	}
+	return;
+
+ssl_err:
+	throw sinsp_exception(string("Invalid K8S SSL entry: ") + (ssl_cert ? *ssl_cert : string("NULL")));
+#endif // HAS_CAPTURE
+}
+
+void sinsp::make_k8s_client()
+{
+	bool is_live = m_k8s_api_server && !m_k8s_api_server->empty();
+	m_k8s_client = new k8s(m_k8s_api_server ? *m_k8s_api_server : std::string()
+		,is_live // capture
+#ifdef HAS_CAPTURE
+		,m_k8s_ssl
+		,m_k8s_bt
+		,true // blocking
+#endif // HAS_CAPTURE
+		,nullptr
+#ifdef HAS_CAPTURE
+		,m_ext_list_ptr
+#else
+		,nullptr
+#endif // HAS_CAPTURE
+	);
+}
+
+void sinsp::init_k8s_client(string* api_server, string* ssl_cert, bool verbose)
+{
+	ASSERT(api_server);
+	m_verbose_json = verbose;
+	m_k8s_api_server = api_server;
+	m_k8s_api_cert = ssl_cert;
+
+	
+#ifdef HAS_CAPTURE
+	if(m_k8s_api_detected && m_k8s_ext_detect_done)
+#endif // HAS_CAPTURE
+	{
+		if(m_k8s_client)
+		{
+			delete m_k8s_client;
+			m_k8s_client = nullptr;
+		}
+		init_k8s_ssl(api_server, ssl_cert);
+		make_k8s_client();
+	}
+}
+
+void sinsp::collect_k8s()
+{
+	if(m_parser)
+	{
+		if(m_k8s_api_server)
+		{
+			if(!m_k8s_client)
+			{
+				init_k8s_client(m_k8s_api_server, m_k8s_api_cert, m_verbose_json);
+				if(m_k8s_client)
+				{
+					g_logger.log("K8s client created.", sinsp_logger::SEV_DEBUG);
+				}
+				else
+				{
+					g_logger.log("K8s client NOT created.", sinsp_logger::SEV_DEBUG);
+				}
+			}
+			if(m_k8s_client)
+			{
+				if(m_lastevent_ts > m_k8s_last_watch_time_ns + ONE_SECOND_IN_NS)
+				{
+					m_k8s_last_watch_time_ns = m_lastevent_ts;
+					g_logger.log("K8s updating state ...", sinsp_logger::SEV_DEBUG);
+					uint64_t delta = sinsp_utils::get_current_time_ns();
+					m_k8s_client->watch();
+					m_parser->schedule_k8s_events(&m_meta_evt);
+					delta = sinsp_utils::get_current_time_ns() - delta;
+					g_logger.format(sinsp_logger::SEV_DEBUG, "Updating Kubernetes state took %" PRIu64 " ms", delta / 1000000LL);
+				}
+			}
+		}
+	}
+}
+
+void sinsp::k8s_discover_ext()
+{
+#ifdef HAS_CAPTURE
+	try
+	{
+		if(m_k8s_api_server && !m_k8s_api_server->empty() && !m_k8s_ext_detect_done)
+		{
+			g_logger.log("K8s API extensions handler: detecting extensions.", sinsp_logger::SEV_TRACE);
+			if(!m_k8s_ext_handler)
+			{
+				if(!m_k8s_collector)
+				{
+					m_k8s_collector = std::make_shared<k8s_handler::collector_t>();
+				}
+				if(uri(*m_k8s_api_server).is_secure()) { init_k8s_ssl(m_k8s_api_server, m_k8s_api_cert); }
+				m_k8s_ext_handler.reset(new k8s_api_handler(m_k8s_collector, *m_k8s_api_server,
+															"/apis/extensions/v1beta1", "[.resources[].name]",
+															"1.1", m_k8s_ssl, m_k8s_bt, true));
+				g_logger.log("K8s API extensions handler: collector created.", sinsp_logger::SEV_TRACE);
+			}
+			else
+			{
+				g_logger.log("K8s API extensions handler: collecting data.", sinsp_logger::SEV_TRACE);
+				m_k8s_ext_handler->collect_data();
+				if(m_k8s_ext_handler->ready())
+				{
+					g_logger.log("K8s API extensions handler: data received.", sinsp_logger::SEV_TRACE);
+					if(m_k8s_ext_handler->error())
+					{
+						g_logger.log("K8s API extensions handler: data error occurred while detecting API extensions.",
+									 sinsp_logger::SEV_WARNING);
+						m_ext_list_ptr.reset();
+					}
+					else
+					{
+						const k8s_api_handler::api_list_t& exts = m_k8s_ext_handler->extensions();
+						std::ostringstream ostr;
+						k8s_ext_list_t ext_list;
+						for(const auto& ext : exts)
+						{
+							ext_list.insert(ext);
+							ostr << std::endl << ext;
+						}
+						g_logger.log("K8s API extensions handler extensions found: " + ostr.str(),
+									 sinsp_logger::SEV_DEBUG);
+						m_ext_list_ptr.reset(new k8s_ext_list_t(ext_list));
+					}
+					m_k8s_ext_detect_done = true;
+					m_k8s_collector.reset();
+					m_k8s_ext_handler.reset();
+				}
+				else
+				{
+					g_logger.log("K8s API extensions handler: not ready.", sinsp_logger::SEV_TRACE);
+				}
+			}
+		}
+	}
+	catch(std::exception& ex)
+	{
+		g_logger.log(std::string("K8s API extensions handler error: ").append(ex.what()),
+					 sinsp_logger::SEV_ERROR);
+		m_k8s_ext_detect_done = false;
+		m_k8s_collector.reset();
+		m_k8s_ext_handler.reset();
+	}
+	g_logger.log("K8s API extensions handler: detection done.", sinsp_logger::SEV_TRACE);
+#endif // HAS_CAPTURE
+}
+
+void sinsp::update_k8s_state()
+{
+#ifdef HAS_CAPTURE
+	try
+	{
+		if(m_k8s_api_server && !m_k8s_api_server->empty())
+		{
+			if(!m_k8s_api_detected)
+			{
+				if(!m_k8s_api_handler)
+				{
+					if(!m_k8s_collector)
+					{
+						m_k8s_collector = std::make_shared<k8s_handler::collector_t>();
+					}
+					if(uri(*m_k8s_api_server).is_secure() && (!m_k8s_ssl || ! m_k8s_bt))
+					{
+						init_k8s_ssl(m_k8s_api_server, m_k8s_api_cert);
+					}
+					m_k8s_api_handler.reset(new k8s_api_handler(m_k8s_collector, *m_k8s_api_server,
+																"/api", ".versions", "1.1",
+																m_k8s_ssl, m_k8s_bt, true));
+				}
+				else
+				{
+					m_k8s_api_handler->collect_data();
+					if(m_k8s_api_handler->ready())
+					{
+						g_logger.log("K8s API handler data received.", sinsp_logger::SEV_DEBUG);
+						if(m_k8s_api_handler->error())
+						{
+							g_logger.log("K8s API handler data error occurred while detecting API versions.",
+										 sinsp_logger::SEV_ERROR);
+						}
+						else
+						{
+							m_k8s_api_detected = m_k8s_api_handler->has("v1");
+							if(m_k8s_api_detected)
+							{
+								g_logger.log("K8s API server v1 detected.", sinsp_logger::SEV_DEBUG);
+							}
+						}
+						m_k8s_collector.reset();
+						m_k8s_api_handler.reset();
+					}
+					else
+					{
+						g_logger.log("K8s API handler not ready yet.", sinsp_logger::SEV_DEBUG);
+					}
+				}
+			}
+			if(m_k8s_api_detected && !m_k8s_ext_detect_done)
+			{
+				k8s_discover_ext();
+			}
+			if(m_k8s_api_detected && m_k8s_ext_detect_done)
+			{
+				collect_k8s();
+			}
+		}
+	}
+	catch(std::exception& e)
+	{
+		g_logger.log(std::string("Error fetching K8s data: ").append(e.what()), sinsp_logger::SEV_ERROR);
+		throw;
+	}
+#endif // HAS_CAPTURE
+}
+
+bool sinsp::get_mesos_data()
+{
+	bool ret = false;
+#ifdef HAS_CAPTURE
+	try
+	{
+		static time_t last_mesos_refresh = 0;
+		ASSERT(m_mesos_client);
+		ASSERT(m_mesos_client->is_alive());
+
+		time_t now; time(&now);
+		if(last_mesos_refresh)
+		{
+			g_logger.log("Collecting Mesos data ...", sinsp_logger::SEV_DEBUG);
+			ret = m_mesos_client->collect_data();
+		}
+		if(difftime(now, last_mesos_refresh) > 10)
+		{
+			g_logger.log("Requesting Mesos data ...", sinsp_logger::SEV_DEBUG);
+			m_mesos_client->send_data_request(false);
+			last_mesos_refresh = now;
+		}
+	}
+	catch(std::exception& ex)
+	{
+		g_logger.log(std::string("Mesos exception: ") + ex.what(), sinsp_logger::SEV_ERROR);
+		delete m_mesos_client;
+		m_mesos_client = NULL;
+		init_mesos_client(0, m_verbose_json);
+	}
+#endif // HAS_CAPTURE
+	return ret;
+}
+
+void sinsp::update_mesos_state()
+{
+	ASSERT(m_mesos_client);
+	if(m_lastevent_ts > m_mesos_last_watch_time_ns + ONE_SECOND_IN_NS)
+	{
+		m_mesos_last_watch_time_ns = m_lastevent_ts;
+		if(m_mesos_client->is_alive())
+		{
+			uint64_t delta = sinsp_utils::get_current_time_ns();
+			if(m_parser && get_mesos_data())
+			{
+				m_parser->schedule_mesos_events(&m_meta_evt);
+				delta = sinsp_utils::get_current_time_ns() - delta;
+				g_logger.format(sinsp_logger::SEV_DEBUG, "Updating Mesos state took %" PRIu64 " ms", delta / 1000000LL);
+			}
+		}
+		else
+		{
+			g_logger.format(sinsp_logger::SEV_ERROR, "Mesos connection not active anymore, retrying ...");
+			delete m_mesos_client;
+			m_mesos_client = NULL;
+			init_mesos_client(0, m_verbose_json);
+		}
+	}
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1249,17 +2011,17 @@ bool sinsp_thread_manager::remove_inactive_threads()
 		//
 		if(m_inspector->m_inactive_thread_scan_time_ns > 30 * ONE_SECOND_IN_NS)
 		{
-			m_last_flush_time_ns = 
+			m_last_flush_time_ns =
 				(m_inspector->m_lastevent_ts - m_inspector->m_inactive_thread_scan_time_ns + 30 * ONE_SECOND_IN_NS);
 		}
 		else
 		{
-			m_last_flush_time_ns = 
-				(m_inspector->m_lastevent_ts - m_inspector->m_inactive_thread_scan_time_ns);			
+			m_last_flush_time_ns =
+				(m_inspector->m_lastevent_ts - m_inspector->m_inactive_thread_scan_time_ns);
 		}
 	}
 
-	if(m_inspector->m_lastevent_ts > 
+	if(m_inspector->m_lastevent_ts >
 		m_last_flush_time_ns + m_inspector->m_inactive_thread_scan_time_ns)
 	{
 		res = true;
@@ -1275,7 +2037,7 @@ bool sinsp_thread_manager::remove_inactive_threads()
 		{
 			bool closed = (it->second.m_flags & PPM_CL_CLOSED) != 0;
 
-			if(closed || 
+			if(closed ||
 				((m_inspector->m_lastevent_ts > it->second.m_lastaccess_ts + m_inspector->m_thread_timeout_ns) &&
 					!scap_is_thread_alive(m_inspector->m_h, it->second.m_pid, it->first, it->second.m_comm.c_str()))
 					)

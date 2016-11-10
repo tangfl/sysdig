@@ -35,6 +35,14 @@ template<> sinsp_fdinfo_t::sinsp_fdinfo()
 	m_usrstate = NULL;
 }
 
+template<> void sinsp_fdinfo_t::reset()
+{
+	m_type = SCAP_FD_UNINITIALIZED;
+	m_flags = FLAGS_NONE;
+	m_callbaks = NULL;
+	m_usrstate = NULL;
+}
+
 template<> string* sinsp_fdinfo_t::tostring()
 {
 	return &m_name;
@@ -75,7 +83,7 @@ template<> char sinsp_fdinfo_t::get_typechar()
 	case SCAP_FD_TIMERFD:
 		return CHAR_FD_TIMERFD;
 	default:
-		ASSERT(false);
+//		ASSERT(false);
 		return '?';
 	}
 }
@@ -116,7 +124,8 @@ template<> char* sinsp_fdinfo_t::get_typestring()
 template<> string sinsp_fdinfo_t::tostring_clean()
 {
 	string m_tstr = m_name;
-	m_tstr.erase(remove_if(m_tstr.begin(), m_tstr.end(), g_invalidchar()), m_tstr.end());
+	sanitize_string(m_tstr);
+
 	return m_tstr;
 }
 
@@ -126,42 +135,10 @@ template<> void sinsp_fdinfo_t::add_filename(const char* fullpath)
 }
 
 template<> bool sinsp_fdinfo_t::set_net_role_by_guessing(sinsp* inspector,
-										  sinsp_threadinfo* ptinfo, 
+										  sinsp_threadinfo* ptinfo,
 										  sinsp_fdinfo_t* pfdinfo,
 										  bool incoming)
 {
-/*
-	bool is_sip_local = 
-		inspector->get_ifaddr_list()->is_ipv4addr_in_local_machine(pfdinfo->m_sockinfo.m_ipv4info.m_fields.m_sip);
-	bool is_dip_local = 
-		inspector->get_ifaddr_list()->is_ipv4addr_in_local_machine(pfdinfo->m_sockinfo.m_ipv4info.m_fields.m_dip);
-
-	//
-	// If only the client is local, mark the role as client.
-	// If only the server is local, mark the role as server.
-	//
-	if(is_sip_local)
-	{
-		if(!is_dip_local)
-		{
-			pfdinfo->set_role_client();
-			return true;
-		}
-	}
-	else if(is_dip_local)
-	{
-		if(!is_sip_local)
-		{
-			pfdinfo->set_role_server();
-			return true;
-		}
-	}
-
-	//
-	// Both addresses are local
-	//
-	ASSERT(is_sip_local && is_dip_local);
-*/
 	//
 	// If this process owns the port, mark it as server, otherwise mark it as client
 	//
@@ -310,86 +287,54 @@ sinsp_fdtable::sinsp_fdtable(sinsp* inspector)
 	reset_cache();
 }
 
-sinsp_fdinfo_t* sinsp_fdtable::find(int64_t fd)
-{
-	unordered_map<int64_t, sinsp_fdinfo_t>::iterator fdit = m_table.find(fd);
-
-	//
-	// Try looking up in our simple cache
-	//
-	if(m_last_accessed_fd != -1 && fd == m_last_accessed_fd)
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_inspector->m_stats.m_n_cached_fd_lookups++;
-#endif
-		return m_last_accessed_fdinfo;
-	}
-
-	//
-	// Caching failed, do a real lookup
-	//
-	fdit = m_table.find(fd);
-
-	if(fdit == m_table.end())
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_inspector->m_stats.m_n_failed_fd_lookups++;
-#endif
-		return NULL;
-	}
-	else
-	{
-#ifdef GATHER_INTERNAL_STATS
-		m_inspector->m_stats.m_n_noncached_fd_lookups++;
-#endif
-		m_last_accessed_fd = fd;
-		m_last_accessed_fdinfo = &(fdit->second);
-		return &(fdit->second);
-	}
-}
-
 sinsp_fdinfo_t* sinsp_fdtable::add(int64_t fd, sinsp_fdinfo_t* fdinfo)
 {
-	pair<unordered_map<int64_t, sinsp_fdinfo_t>::iterator, bool> insert_res;
-
-	//
-	// NOTE: emplace would be more efficinent and avoid the multiple contrcutions
-	// required by make_pair, but it's not supported by some gcc versions, so
-	// we use insert for the moment.
-	//
-	insert_res = m_table.insert(std::make_pair(fd, *fdinfo));
-	//insert_res = m_table.emplace(fd, *fdinfo);
-
 	//
 	// Look for the FD in the table
 	//
-	if(insert_res.second == true)
+	auto it = m_table.find(fd);
+
+	// Three possible exits here:
+	// 1. fd is not on the table
+	//   a. the table size is under the limit so create a new entry
+	//   b. table size is over the limit, discard the fd
+	// 2. fd is already in the table, replace it
+	if(it == m_table.end())
 	{
-		//
-		// No entry in the table, this is the normal case
-		//
-		m_last_accessed_fd = -1;
+		if(m_table.size() < m_inspector->m_max_fdtable_size)
+		{
+			//
+			// No entry in the table, this is the normal case
+			//
+			m_last_accessed_fd = -1;
 #ifdef GATHER_INTERNAL_STATS
-		m_inspector->m_stats.m_n_added_fds++;
+			m_inspector->m_stats.m_n_added_fds++;
 #endif
+			pair<unordered_map<int64_t, sinsp_fdinfo_t>::iterator, bool> insert_res = m_table.emplace(fd, *fdinfo);
+			return &(insert_res.first->second);
+		}
+		else
+		{
+			return nullptr;
+		}
 	}
 	else
 	{
 		//
 		// the fd is already in the table.
 		//
-		if(insert_res.first->second.m_flags & sinsp_fdinfo_t::FLAGS_CLOSE_IN_PROGRESS)
+		if(it->second.m_flags & sinsp_fdinfo_t::FLAGS_CLOSE_IN_PROGRESS)
 		{
 			//
 			// Sometimes an FD-creating syscall can be called on an FD that is being closed (i.e
-			// the close enter has arrived but the close exit has not arrived yet). 
+			// the close enter has arrived but the close exit has not arrived yet).
 			// If this is the case, mark the new entry so that the successive close exit won't
 			// destroy it.
 			//
 			fdinfo->m_flags &= ~sinsp_fdinfo_t::FLAGS_CLOSE_IN_PROGRESS;
 			fdinfo->m_flags |= sinsp_fdinfo_t::FLAGS_CLOSE_CANCELED;
-			
-			m_table[CANCELED_FD_NUMBER] = insert_res.first->second;
+
+			m_table[CANCELED_FD_NUMBER] = it->second;
 		}
 		else
 		{
@@ -409,10 +354,9 @@ sinsp_fdinfo_t* sinsp_fdtable::add(int64_t fd, sinsp_fdinfo_t* fdinfo)
 		//
 		// Replace the fd as a struct copy
 		//
-		insert_res.first->second.copy(*fdinfo, true);
+		it->second.copy(*fdinfo, true);
+		return &(it->second);
 	}
-
-	return &(insert_res.first->second);
 }
 
 void sinsp_fdtable::erase(int64_t fd)
@@ -421,7 +365,7 @@ void sinsp_fdtable::erase(int64_t fd)
 
 	if(fd == m_last_accessed_fd)
 	{
-		m_last_accessed_fd = -1;		
+		m_last_accessed_fd = -1;
 	}
 
 	if(fdit == m_table.end())

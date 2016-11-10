@@ -26,18 +26,26 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
 #include <algorithm> 
 
 #include <sinsp.h>
-#include "sysdig.h"
 #include "chisel.h"
+#include "sysdig.h"
 
-#define DESCRIPTION_TEXT_START 20
+// Must match the value in the zsh tab completion
+#define DESCRIPTION_TEXT_START 16
+
+
 #define CONSOLE_LINE_LEN 79
 #define PRINTF_WRAP_CPROC(x)  #x
 #define PRINTF_WRAP(x) PRINTF_WRAP_CPROC(x)
 
-void list_fields(bool verbose)
+void list_fields(bool verbose, bool markdown)
 {
 	uint32_t j, l, m;
 	int32_t k;
+
+	if(markdown)
+	{
+		printf("# Sysdig Filter Fields List\n\n");
+	}
 
 	vector<const filter_check_info*> fc_plugins;
 	sinsp::get_filtercheck_fields_info(&fc_plugins);
@@ -46,53 +54,83 @@ void list_fields(bool verbose)
 	{
 		const filter_check_info* fci = fc_plugins[j];
 
-		printf("\n----------------------\n");
-		printf("Field Class: %s\n\n", fci->m_name.c_str());
+		if(fci->m_flags & filter_check_info::FL_HIDDEN)
+		{
+			continue;
+		}
+
+		if(markdown)
+		{
+			printf("## Filter Class: %s\n\n", fci->m_name.c_str());
+		}
+		else
+		{
+			printf("\n----------------------\n");
+			printf("Field Class: %s\n\n", fci->m_name.c_str());
+		}
 
 		for(k = 0; k < fci->m_nfields; k++)
 		{
 			const filtercheck_field_info* fld = &fci->m_fields[k];
 
-			printf("%s", fld->m_name);
-			uint32_t namelen = (uint32_t)strlen(fld->m_name);
-
-			ASSERT(namelen < DESCRIPTION_TEXT_START);
-
-			for(l = 0; l < DESCRIPTION_TEXT_START - namelen; l++)
+			if(fld->m_flags & EPF_TABLE_ONLY)
 			{
-				printf(" ");
+				continue;
 			}
 
-			string desc(fld->m_description);
-
-			if(fld->m_flags & EPF_FILTER_ONLY)
+			if(markdown)
 			{
-				desc = "(FILTER ONLY) " + desc;
+				printf("**Name**: %s  \n", fld->m_name);
+				printf("**Description**: %s  \n", fld->m_description);
+				printf("**Type**: %s  \n\n", param_type_to_string(fld->m_type));
 			}
-
-			if(verbose)
+			else
 			{
-				desc += string(" Type:") + param_type_to_string(fld->m_type) + ".";
-			}
+				printf("%s", fld->m_name);
+				uint32_t namelen = (uint32_t)strlen(fld->m_name);
 
-			size_t desclen = desc.size();
-
-			for(l = 0; l < desclen; l++)
-			{
-				if(l % (CONSOLE_LINE_LEN - DESCRIPTION_TEXT_START) == 0 && l != 0)
+				if(namelen >= DESCRIPTION_TEXT_START)
 				{
 					printf("\n");
-
-					for(m = 0; m < DESCRIPTION_TEXT_START; m++)
-					{
-						printf(" ");
-					}
+					namelen = 0;
 				}
 
-				printf("%c", desc[l]);
-			}
+				for(l = 0; l < DESCRIPTION_TEXT_START - namelen; l++)
+				{
+					printf(" ");
+				}
 
-			printf("\n");
+				string desc(fld->m_description);
+
+				if(fld->m_flags & EPF_FILTER_ONLY)
+				{
+					desc = "(FILTER ONLY) " + desc;
+				}
+
+				if(verbose)
+				{
+					desc += string(" Type:") + param_type_to_string(fld->m_type) + ".";
+				}
+
+				size_t desclen = desc.size();
+
+				for(l = 0; l < desclen; l++)
+				{
+					if(l % (CONSOLE_LINE_LEN - DESCRIPTION_TEXT_START) == 0 && l != 0)
+					{
+						printf("\n");
+
+						for(m = 0; m < DESCRIPTION_TEXT_START; m++)
+						{
+							printf(" ");
+						}
+					}
+
+					printf("%c", desc[l]);
+				}
+
+				printf("\n");
+			}
 		}
 	}
 }
@@ -199,6 +237,15 @@ const char* param_type_to_string(ppm_param_type pt)
 		break;
 	case PT_GID:
 		return "GID";
+		break;
+	case PT_SIGSET:
+		return "SIGSET";
+		break;
+	case PT_IPV4NET:
+		return "IPV4NET";
+		break;
+	case PT_DOUBLE:
+		return "DOUBLE";
 		break;
 	default:
 		ASSERT(false);
@@ -336,6 +383,11 @@ void list_chisels(vector<chisel_desc>* chlist, bool verbose)
 	{
 		chisel_desc* cd = &(chlist->at(j));
 
+		if(cd->m_viewinfo.m_valid)
+		{
+			continue;
+		}
+
 		string category = cd->m_category;
 
 		if(category != last_category) 
@@ -355,7 +407,11 @@ void list_chisels(vector<chisel_desc>* chlist, bool verbose)
 		printf("%s", cd->m_name.c_str());
 		uint32_t namelen = (uint32_t)cd->m_name.size();
 
-		ASSERT(namelen < (DESCRIPTION_TEXT_START));
+		if(namelen >= DESCRIPTION_TEXT_START)
+		{
+			printf("\n");
+			namelen = 0;
+		}
 
 		for(l = 0; l < (DESCRIPTION_TEXT_START - namelen); l++)
 		{

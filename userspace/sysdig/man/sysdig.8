@@ -8,6 +8,9 @@ sysdig \- the definitive system and process troubleshooting tool
 [\f[I]filter\f[]]
 .SS DESCRIPTION
 .PP
+\f[B]Note: if you are interested in an easier to use interface for the
+sysdig functionality, use the csysdig command line utility.\f[]
+.PP
 sysdig is a tool for system troubleshooting, analysis and exploration.
 It can be used to capture, filter and decode system calls and other OS
 events.
@@ -25,7 +28,7 @@ and can be extended through Lua scripts, called chisels.
 By default, sysdig prints the information for each captured event on a
 single line, with the following format:
 .PP
-\f[C]<evt.num>\ <evt.time>\ <evt.cpu>\ <proc.name>\ <thread.tid>\ <evt.dir>\ <evt.type>\ <evt.args>\f[]
+\f[C]*%evt.num\ %evt.time\ %evt.cpu\ %proc.name\ (%thread.tid)\ %evt.dir\ %evt.type\ %evt.info\f[]
 .PP
 where:
 .IP \[bu] 2
@@ -74,7 +77,7 @@ the fields listed by \[aq]sysdig \-l\[aq].
 Using \-pc or \-pcontainer, the default format will be changed to a
 container\-friendly one:
 .PP
-\f[C]%evt.num\ %evt.time\ %evt.cpu\ %container.name\ (%container.id)\ %proc.name\ (%thread.tid:%thread.vtid)\ %evt.dir\ %evt.type\ %evt.info\f[]
+\f[C]*%evt.num\ %evt.time\ %evt.cpu\ %container.name\ (%container.id)\ %proc.name\ (%thread.tid:%thread.vtid)\ %evt.dir\ %evt.type\ %evt.info\f[]
 .PP
 \f[B]Trace Files\f[]
 .PP
@@ -117,7 +120,8 @@ The list of available fields can be obtained with \[aq]sysdig \-l\[aq].
 .PD
 Filter expressions can use one of these comparison operators:
 \f[I]=\f[], \f[I]!=\f[], \f[I]<\f[], \f[I]<=\f[], \f[I]>\f[],
-\f[I]>=\f[], \f[I]contains\f[], \f[I]in\f[] and \f[I]exists\f[].
+\f[I]>=\f[], \f[I]contains\f[], \f[I]icontains\f[], \f[I]in\f[] and
+\f[I]exists\f[].
 e.g.
 .RS
 .PP
@@ -132,7 +136,7 @@ $ sysdig "evt.type in ( \[aq]select\[aq], \[aq]poll\[aq] )"
 $ sysdig proc.name exists
 .RE
 .PP
-Multiple checks can be combined through brakets and the following
+Multiple checks can be combined through brackets and the following
 boolean operators: \f[I]and\f[], \f[I]or\f[], \f[I]not\f[].
 e.g.
 .RS
@@ -209,6 +213,20 @@ run the specified chisel.
 If the chisel require arguments, they must be specified in the command
 line after the name.
 .PP
+\f[B]\-C\f[] \f[I]filesize\f[]
+.PD 0
+.P
+.PD
+Break a capture into separate files, and limit the size of each file
+based on the specified number of megabytes.
+The units of \f[I]filesize\f[] are millions of bytes (10^6, not 2^20).
+Use in conjunction with \f[B]\-W\f[] to enable automatic file rotation.
+Otherwise, new files will continue to be created until the capture is
+manually stopped.
+.PP
+Files will have the name specified by \f[B]\-w\f[] with a counter added
+starting at 0.
+.PP
 \f[B]\-cl\f[], \f[B]\-\-list\-chisels\f[]
 .PD 0
 .P
@@ -232,7 +250,8 @@ FD names) to be lost.
 .PD 0
 .P
 .PD
-Capture events about sysdig itself
+Capture events about sysdig itself and print additional logging on
+standard error.
 .PP
 \f[B]\-E\f[], \f[B]\-\-exclude\-users\f[]
 .PD 0
@@ -241,11 +260,24 @@ Capture events about sysdig itself
 Don\[aq]t create the user/group tables by querying the OS when sysdig
 starts.
 This also means that no user or group info will be written to the
-tracefile by the \-w flag.
+tracefile by the \f[B]\-w\f[] flag.
 The user/group tables are necessary to use filter fields like user.name
 or group.name.
 However, creating them can increase sysdig\[aq]s startup time.
 Moreover, they contain information that could be privacy sensitive.
+.PP
+\f[B]\-e\f[] \f[I]numevents\f[]
+.PD 0
+.P
+.PD
+Break a capture into separate files, and limit the size of each file
+based on the specified number of events.
+Use in conjunction with \f[B]\-W\f[] to enable automatic file rotation.
+Otherwise, new files will continue to be created until the capture is
+manually stopped.
+.PP
+Files will have the name specified by \f[B]\-w\f[] with a counter added
+starting at 0.
 .PP
 \f[B]\-F\f[], \f[B]\-\-fatfile\f[]
 .PD 0
@@ -264,18 +296,36 @@ With fatfile mode, those events are still saved to file, but
 Be aware that using this flag might generate substantially bigger traces
 files.
 .PP
+\f[B]\-\-filter\-proclist\f[]
+.PD 0
+.P
+.PD
+apply the filter to the process table.
+A full dump of /proc is typically included in any trace file to make
+sure all the state required to decode events is in the file.
+This could cause the file to contain unwanted or sensitive information.
+Using this flag causes the command line filter to be applied to the
+/proc dump as well.
+.PP
+\f[B]\-G\f[] \f[I]numseconds\f[]
+.PD 0
+.P
+.PD
+Break a capture into separate files, and limit the size of each file
+based on the specified number of seconds.
+Use in conjunction with \f[B]\-W\f[] to enable automatic file rotation.
+Otherwise, new files will continue to be created until the capture is
+manually stopped.
+.PP
+Files will have the name specified by \f[B]\-w\f[] which should include
+a time format as defined by strftime(3).
+If no time format is specified, a counter will be used.
+.PP
 \f[B]\-h\f[], \f[B]\-\-help\f[]
 .PD 0
 .P
 .PD
 Print this page
-.PP
-\f[B]\-j\f[], \f[B]\-\-json\f[]
-.PD 0
-.P
-.PD
-Emit output as json, data buffer encoding will depend from the print
-format selected.
 .PP
 \f[B]\-i \f[I]chiselname\f[]\f[],
 \f[B]\-\-chisel\-info=\f[]\f[I]chiselname\f[]
@@ -284,6 +334,47 @@ format selected.
 .PD
 Get a longer description and the arguments associated with a chisel
 found in the \-cl option list.
+.PP
+\f[B]\-j\f[], \f[B]\-\-json\f[]
+.PD 0
+.P
+.PD
+Emit output as json, data buffer encoding will depend from the print
+format selected.
+.PP
+\f[B]\-k\f[], \f[B]\-\-k8s\-api\f[]
+.PD 0
+.P
+.PD
+Enable Kubernetes support by connecting to the API server specified as
+argument.
+E.g.
+"<http://admin:password@127.0.0.1:8080>".
+The API server can also be specified via the environment variable
+SYSDIG_K8S_API.
+.PP
+\f[B]\-K\f[] \f[I]btfile | certfile:keyfile[#password][:cacertfile]\f[],
+\f[B]\-\-k8s\-api\-cert=\f[]\f[I]btfile |
+certfile:keyfile[#password][:cacertfile]\f[]
+.PD 0
+.P
+.PD
+Use the provided files names to authenticate user and (optionally)
+verify the K8S API server identity.
+Each entry must specify full (absolute, or relative to the current
+directory) path to the respective file.
+Private key password is optional (needed only if key is password
+protected).
+CA certificate is optional.
+For all files, only PEM file format is supported.
+Specifying CA certificate only is obsoleted \- when single entry is
+provided for this option, it will be interpreted as the name of a file
+containing bearer token.
+Note that the format of this command\-line option prohibits use of files
+whose names contain \[aq]:\[aq] or \[aq]#\[aq] characters in the file
+name.
+Option can also be provided via the environment variable
+SYSDIG_K8S_API_CERT.
 .PP
 \f[B]\-L\f[], \f[B]\-\-list\-events\f[]
 .PD 0
@@ -297,6 +388,42 @@ List the events that the engine supports
 .PD
 List the fields that can be used for filtering and output formatting.
 Use \-lv to get additional information for each field.
+.PP
+\f[B]\-m\f[] \f[I]url[,marathon\-url]\f[],
+\f[B]\-\-mesos\-api=\f[]\f[I]url[,marathon\-url]\f[]
+.PD 0
+.P
+.PD
+Enable Mesos support by connecting to the API server specified as
+argument (e.g.
+<http://admin:password@127.0.0.1:5050>).
+Mesos url is required.
+Marathon url is optional, defaulting to auto\-follow \- if Marathon API
+server is not provided, sysdig will attempt to retrieve (and
+subsequently follow, if it migrates) the location of Marathon API server
+from the Mesos master.
+Note that, with auto\-follow, sysdig will likely receive a cluster
+internal IP address for Marathon API server, so running sysdig with
+Marathon auto\-follow from a node that is not part of Mesos cluster may
+not work.
+Additionally, running sysdig with Mesos support on a node that has no
+containers managed by Mesos is of limited use because, although cluster
+metadata will be collected, there will be no Mesos/Marathon filtering
+capability.
+The API servers can also be specified via the environment variable
+SYSDIG_MESOS_API.
+.PP
+\f[B]\-N\f[]
+.PD 0
+.P
+.PD
+Don\[aq]t convert port numbers to names.
+.PP
+\f[B]\-M\f[] \f[I]num\f[]seconds_
+.PD 0
+.P
+.PD
+Stop collecting after reaching
 .PP
 \f[B]\-n\f[] \f[I]num\f[], \f[B]\-\-numevents\f[]=\f[I]num\f[]
 .PD 0
@@ -317,7 +444,10 @@ Print progress on stderr while processing trace files.
 .PD
 Specify the format to be used when printing the events.
 With \-pc or \-pcontainer will use a container\-friendly format.
-See the examples section below for more info.
+With \-pk or \-pkubernetes will use a kubernetes\-friendly format.
+With \-pm or \-pmesos will use a mesos\-friendly format.
+Specifying \f[B]\-pp\f[] on the command line will cause sysdig to print
+the default command line format and exit.
 .PP
 \f[B]\-q\f[], \f[B]\-\-quiet\f[]
 .PD 0
@@ -354,8 +484,28 @@ Use this option with caution, it can generate huge trace files.
 Change the way event time is displayed.
 Accepted values are \f[B]h\f[] for human\-readable string, \f[B]a\f[]
 for absolute timestamp from epoch, \f[B]r\f[] for relative time from the
-beginning of the capture, \f[B]d\f[] for delta between event enter and
+first displayed event, \f[B]d\f[] for delta between event enter and
 exit, and \f[B]D\f[] for delta from the previous event.
+.PP
+\f[B]\-T\f[], \f[B]\-\-force\-tracers\-capture\f[]
+.PD 0
+.P
+.PD
+Tell the driver to make sure full buffers are captured from /dev/null,
+to make sure that tracers are completely captured.
+Note that sysdig will enable extended /dev/null capture by itself after
+detecting that tracers are written there, but that could result in the
+truncation of some tracers at the beginning of the capture.
+This option allows preventing that.
+.PP
+\f[B]\-\-unbuffered\f[]
+.PD 0
+.P
+.PD
+Turn off output buffering.
+This causes every single line emitted by sysdig to be flushed, which
+generates higher CPU usage but is useful when piping sysdig\[aq]s output
+into another process or into a script.
 .PP
 \f[B]\-v\f[], \f[B]\-\-verbose\f[]
 .PD 0
@@ -379,6 +529,17 @@ Print version number.
 .P
 .PD
 Write the captured events to \f[I]writefile\f[].
+.PP
+\f[B]\-W\f[] \f[I]num\f[]
+.PD 0
+.P
+.PD
+Turn on file rotation for continuous capture, and limit the number of
+files created to the specified number.
+Once the cap is reached, older files will be overwriten (ring buffer).
+Use in conjunction with the \f[B]\-C\f[] / \f[B]\-G\f[] / \f[B]\-e\f[]
+options to limit the size of each file based on number of megabytes,
+seconds, and/or events (respectively).
 .PP
 \f[B]\-x\f[], \f[B]\-\-print\-hex\f[]
 .PD 0
@@ -409,6 +570,13 @@ Capture all the events from the live system and save them to disk
 .RS
 .PP
 $ sysdig \-w dumpfile.scap
+.RE
+.PP
+Capture all the events in the latest 24 hours and save them to disk
+organized in files containing 1 hour of system activity each
+.RS
+.PP
+$ sysdig \-G 3600 \-W 24 \-w dumpfile.scap
 .RE
 .PP
 Read events from a file and print them to screen
@@ -468,8 +636,9 @@ While it is possible to use sysdig with LuaJIT in Lua 5.2 mode or
 regular Lua, some chisels may not work as expected.
 .SS AUTHOR
 .PP
-Draios inc.
-<info@draios.com>
+Draios Inc.
+aka sysdig <info@sysdigcloud.com>
 .SS SEE ALSO
 .PP
-\f[B]strace\f[](8), \f[B]tcpdump\f[](8), \f[B]lsof\f[](8)
+\f[B]csysdig\f[](8), \f[B]strace\f[](8), \f[B]tcpdump\f[](8),
+\f[B]lsof\f[](8)

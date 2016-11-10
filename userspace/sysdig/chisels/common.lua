@@ -182,7 +182,7 @@ function print_sorted_table(stable, ts_s, ts_ns, timedelta, viz_info)
 		print(str)
 	else
 		-- Same size to extend each string
-		local EXTEND_STRING_SIZE = 16
+		local EXTEND_STRING_SIZE = 20
 		local header = extend_string(viz_info.value_desc, EXTEND_STRING_SIZE)
 		
 		for i, fldname in ipairs(viz_info.key_desc) do
@@ -199,7 +199,7 @@ function print_sorted_table(stable, ts_s, ts_ns, timedelta, viz_info)
 
 			for i, singlekey in ipairs(singlekeys) do
 				if i < #singlekeys then
-					keystr = keystr .. extend_string(string.sub(singlekey, 0, 10), EXTEND_STRING_SIZE)
+					keystr = keystr .. extend_string(string.sub(singlekey, 0, EXTEND_STRING_SIZE), EXTEND_STRING_SIZE)
 				else
 					keystr = keystr .. singlekey
 				end
@@ -212,7 +212,7 @@ function print_sorted_table(stable, ts_s, ts_ns, timedelta, viz_info)
 			elseif viz_info.value_units == "time" then
 				print(extend_string(format_time_interval(v), EXTEND_STRING_SIZE) .. keystr)
 			elseif viz_info.value_units == "timepct" then
-				if timedelta ~= 0 then
+				if timedelta > 0 then
 					pctstr = string.format("%.2f%%", v / timedelta * 100)
 				else
 					pctstr = "0.00%"
@@ -237,4 +237,33 @@ function parse_numeric_input(value, name)
 		os.exit()
 	end
 	return val
+end
+
+--[[
+Perform a deep copy of a table.
+]]--
+function copytable(orig)
+    local orig_type = type(orig)
+    local copy
+    if orig_type == 'table' then
+        copy = {}
+        for orig_key, orig_value in next, orig, nil do
+            copy[copytable(orig_key)] = copytable(orig_value)
+        end
+        setmetatable(copy, copytable(getmetatable(orig)))
+    else -- number, string, boolean, etc
+        copy = orig
+    end
+    return copy
+end
+
+--[[
+Add the content of a table at the end of another one.
+]]--
+function concattable(dst, src)
+    for i=1,#src do
+        dst[#dst + 1] = src[i]
+    end
+    
+    return dst
 end
